@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
 use aeon_agent_runtime::{
-    canonical_bytes, canonical_digest, ActionRef, AgentId, AgentIdentity, AgentLifecycle,
-    AgentRuntimeRecord, AgentSpec, AuthorityLeaseCertificate, AuthorityRequest, AuthoritySet,
-    AuthorizationId, AuthorizationRecord, AuthorizationState, Budget, CanonicalJson, Contract,
-    Digest, EffectClass, ErrorCode, InMemoryMissionStore, InstructionProfileRef, LeaseId,
-    LeaseRecord, LeaseRef, MemoryEntry, MemoryTrust, MissionEnvelope, MissionEventKind, MissionId,
-    ModelClient, ModelRef, ModelRequest, Objective, ProtocolGate, RegisteredTool, ResourceRequest,
-    Role, RuntimeError, ScriptedModelClient, SecurityLevel, SemanticContext, SemanticRequirements,
-    SignatureBytes, ToolId, ToolRegistry,
+    canonical_bytes, canonical_digest, ActionRef, AgentId, AgentIdentity, AgentIdentityCertificate,
+    AgentLifecycle, AgentRuntimeRecord, AgentSpec, AuthorityLeaseCertificate, AuthorityRequest,
+    AuthoritySet, AuthorizationId, AuthorizationRecord, AuthorizationState, Budget, CanonicalJson,
+    Contract, Digest, EffectClass, ErrorCode, InMemoryKeyCustody, InMemoryMissionStore,
+    InstructionProfileRef, KeyCustody, KeyId, LeaseId, LeaseRecord, LeaseRef, MemoryEntry,
+    MemoryTrust, MissionEnvelope, MissionEventKind, MissionId, ModelClient, ModelRef, ModelRequest,
+    Objective, ProtocolGate, RegisteredTool, ResourceRequest, Role, RuntimeError,
+    ScriptedModelClient, SecurityLevel, SemanticContext, SemanticRequirements, SignatureBytes,
+    ToolId, ToolRegistry,
 };
 use chrono::{Duration, Utc};
 use nexus::Capability;
@@ -109,6 +110,10 @@ fn error_codes_have_stable_display_and_messages() {
         ErrorCode::BudgetExhausted,
         ErrorCode::AgentInactive,
         ErrorCode::LeaseInactive,
+        ErrorCode::IdentityInvalid,
+        ErrorCode::DelegationInvalid,
+        ErrorCode::LeaseGenerationMismatch,
+        ErrorCode::CapabilityManifestMismatch,
         ErrorCode::AuthorizationInvalid,
         ErrorCode::ExecutionFailed,
         ErrorCode::ModelFailed,
@@ -166,6 +171,46 @@ fn identifier_helpers_preserve_validation() {
 }
 
 #[test]
+fn identity_certificates_bind_agent_key_and_issuer_without_exposing_private_keys() {
+    let issuer = InMemoryKeyCustody::generate(KeyId::new("key-issuer").unwrap()).unwrap();
+    let subject = InMemoryKeyCustody::generate(KeyId::new("key-subject").unwrap()).unwrap();
+    let mut certificate = AgentIdentityCertificate::unsigned(
+        AgentId::new("agent-subject").unwrap(),
+        subject.key_id(),
+        subject.verifying_key(),
+        Some(AgentId::new("agent-issuer").unwrap()),
+        issuer.key_id(),
+        Utc::now(),
+    );
+    certificate.signature = issuer
+        .sign(&certificate.signing_payload().unwrap())
+        .unwrap();
+
+    certificate
+        .verify_signature(&issuer.verifying_key())
+        .unwrap();
+    assert_eq!(
+        certificate.verifying_key().unwrap(),
+        subject.verifying_key()
+    );
+    assert!(!certificate.canonical_digest().unwrap().to_hex().is_empty());
+
+    let debug = format!("{issuer:?}").to_ascii_lowercase();
+    assert!(debug.contains("key-issuer"));
+    assert!(!debug.contains("signing_key"));
+    assert!(!debug.contains("secret"));
+
+    certificate.agent_id = AgentId::new("agent-substituted").unwrap();
+    assert_eq!(
+        certificate
+            .verify_signature(&issuer.verifying_key())
+            .unwrap_err()
+            .code(),
+        ErrorCode::IdentityInvalid
+    );
+}
+
+#[test]
 fn mission_predicates_are_default_deny() {
     let mission = sample_mission();
     assert!(mission.is_usable_at(Utc::now()));
@@ -183,6 +228,16 @@ fn mission_predicates_are_default_deny() {
     assert!(!unusable.is_usable_at(Utc::now()));
     unusable.allowed_capabilities.push(Capability::All);
     assert!(unusable.contains_capability_all());
+}
+
+#[test]
+fn authority_sets_use_nexus_attenuation_semantics() {
+    let parent = AuthoritySet::new(vec![Capability::ReadFile("/data".into())]).unwrap();
+    let child = AuthoritySet::new(vec![Capability::ReadFile("/data/reports".into())]).unwrap();
+    assert!(child.is_subset_of(&parent));
+    assert!(parent.covers(&Capability::ReadFile("/data/reports/a.json".into())));
+    assert!(!parent.is_subset_of(&child));
+    assert!(AuthoritySet::new(vec![Capability::All]).is_err());
 }
 
 #[test]
@@ -384,6 +439,11 @@ fn mission_store_keeps_agent_lease_and_authorization_records_separate() {
         mission_id: MissionId::new("mission-1").unwrap(),
         agent_id,
         parent_agent_id: None,
+        agent_identity_digest: digest("agent-identity"),
+        issuer_identity_digest: digest("issuer-identity"),
+        issuer_key_id: KeyId::new("key-issuer").unwrap(),
+        parent_lease: None,
+        renewed_from: None,
         organization_version: 1,
         policy_epoch: 7,
         granted_authority: AuthoritySet {

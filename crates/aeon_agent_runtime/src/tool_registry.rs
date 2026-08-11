@@ -5,6 +5,7 @@ use sha2::{Digest as ShaDigest, Sha256};
 use std::sync::{Arc, RwLock};
 
 use crate::action::EffectClass;
+use crate::authority::{BoundTool, CapabilityManifest};
 use crate::digest::{canonical_digest, Digest};
 use crate::error::{ErrorCode, RuntimeError};
 use crate::ids::ToolId;
@@ -166,7 +167,7 @@ impl ToolRegistry {
     pub fn resolve(&self, tool_id: &ToolId) -> Result<RegisteredTool, RuntimeError> {
         self.tools
             .read()
-            .expect("tool registry lock poisoned")
+            .map_err(|_| registry_error(ErrorCode::Internal, "tool registry lock poisoned"))?
             .iter()
             .find(|tool| &tool.manifest.tool_id == tool_id)
             .cloned()
@@ -181,7 +182,10 @@ impl ToolRegistry {
     }
 
     pub fn replace(&self, replacement: RegisteredTool) -> Result<(), RuntimeError> {
-        let mut tools = self.tools.write().expect("tool registry lock poisoned");
+        let mut tools = self
+            .tools
+            .write()
+            .map_err(|_| registry_error(ErrorCode::Internal, "tool registry lock poisoned"))?;
         let position = tools
             .iter()
             .position(|tool| tool.manifest.tool_id == replacement.manifest.tool_id)
@@ -191,19 +195,67 @@ impl ToolRegistry {
     }
 
     pub fn root_digest(&self) -> Result<Digest, RuntimeError> {
-        let tools = self.tools.read().expect("tool registry lock poisoned");
-        let mut entries = tools
+        let tools = self
+            .tools
+            .read()
+            .map_err(|_| registry_error(ErrorCode::Internal, "tool registry lock poisoned"))?;
+        root_digest_for_tools(&tools)
+    }
+
+    /// Resolves the selected tool and the complete live capability manifest
+    /// under one registry read lock, closing cross-tool manifest races.
+    pub fn resolve_with_capability_manifest(
+        &self,
+        tool_id: &ToolId,
+        template: &CapabilityManifest,
+    ) -> Result<(RegisteredTool, CapabilityManifest), RuntimeError> {
+        let tools = self
+            .tools
+            .read()
+            .map_err(|_| registry_error(ErrorCode::Internal, "tool registry lock poisoned"))?;
+        let selected = tools
             .iter()
-            .map(|tool| {
-                Ok(json!({
-                    "tool_id": tool.manifest.tool_id,
-                    "manifest_digest": tool.manifest_digest()?,
-                }))
+            .find(|tool| &tool.manifest.tool_id == tool_id)
+            .cloned()
+            .ok_or_else(|| registry_error(ErrorCode::UnknownTool, "tool is not registered"))?;
+        let approved_tools = template
+            .approved_tools
+            .iter()
+            .map(|bound| {
+                let registered = tools
+                    .iter()
+                    .find(|tool| tool.manifest.tool_id == bound.tool_id)
+                    .ok_or_else(|| {
+                        registry_error(
+                            ErrorCode::UnknownTool,
+                            "manifest-bound tool is not registered",
+                        )
+                    })?;
+                Ok(BoundTool {
+                    tool_id: bound.tool_id.clone(),
+                    tool_manifest_digest: registered.manifest_digest()?,
+                })
             })
             .collect::<Result<Vec<_>, RuntimeError>>()?;
-        entries.sort_by_key(|entry| entry.to_string());
-        canonical_digest("aeon-tool-registry-root-v1", &entries)
+        let mut manifest = template.clone();
+        manifest.approved_tools = approved_tools;
+        manifest.tool_registry_root_digest = root_digest_for_tools(&tools)?;
+        Ok((selected, manifest))
     }
+}
+
+fn root_digest_for_tools(tools: &[RegisteredTool]) -> Result<Digest, RuntimeError> {
+    let mut entries = tools
+        .iter()
+        .map(|tool| {
+            Ok(json!({
+                "tool_id": tool.manifest.tool_id,
+                "manifest_digest": tool.manifest_digest()?,
+            }))
+        })
+        .collect::<Result<Vec<_>, RuntimeError>>()?;
+    entries.sort_by_key(|entry| entry.to_string());
+    canonical_digest("aeon-tool-registry-root-v1", &entries)
 }
 
 fn validate_schema_definition(schema: &Value) -> Result<(), RuntimeError> {

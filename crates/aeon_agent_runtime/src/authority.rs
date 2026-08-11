@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::digest::{canonical_bytes, canonical_digest, canonical_value_bytes, Digest};
 use crate::error::{ErrorCode, Result, RuntimeError};
-use crate::ids::{AgentId, LeaseId, MissionId, ToolId};
+use crate::ids::{AgentId, KeyId, LeaseId, MissionId, ToolId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,6 +17,35 @@ pub struct AuthorityRequest {
 #[serde(deny_unknown_fields)]
 pub struct AuthoritySet {
     pub capabilities: Vec<Capability>,
+}
+
+impl AuthoritySet {
+    pub fn new(capabilities: Vec<Capability>) -> Result<Self> {
+        if capabilities
+            .iter()
+            .any(|capability| capability == &Capability::All)
+        {
+            return Err(RuntimeError::new(
+                ErrorCode::CapabilityAllForbidden,
+                "Capability::All is forbidden in agent authority",
+            ));
+        }
+        Ok(Self {
+            capabilities: canonical_capabilities(&capabilities)?,
+        })
+    }
+
+    pub fn covers(&self, required: &Capability) -> bool {
+        self.capabilities
+            .iter()
+            .any(|granted| required.is_subset_of(granted))
+    }
+
+    pub fn is_subset_of(&self, parent: &Self) -> bool {
+        self.capabilities
+            .iter()
+            .all(|capability| parent.covers(capability))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,9 +84,20 @@ impl CapabilityManifest {
             tool_registry_root_digest: &'a Digest,
         }
 
+        let mut tool_ids = std::collections::HashSet::with_capacity(self.approved_tools.len());
+        if self
+            .approved_tools
+            .iter()
+            .any(|tool| !tool_ids.insert(tool.tool_id.clone()))
+        {
+            return Err(RuntimeError::new(
+                ErrorCode::CapabilityManifestMismatch,
+                "capability manifest contains duplicate tool identifiers",
+            ));
+        }
+
         let mut approved_tools = self.approved_tools.clone();
         approved_tools.sort_unstable();
-        approved_tools.dedup();
         canonical_digest(
             "aeon-capability-manifest-v1",
             &CanonicalManifest {
@@ -95,6 +135,11 @@ pub struct AuthorityLeaseCertificate {
     pub mission_id: MissionId,
     pub agent_id: AgentId,
     pub parent_agent_id: Option<AgentId>,
+    pub agent_identity_digest: Digest,
+    pub issuer_identity_digest: Digest,
+    pub issuer_key_id: KeyId,
+    pub parent_lease: Option<LeaseRef>,
+    pub renewed_from: Option<LeaseRef>,
     pub organization_version: u64,
     pub policy_epoch: u64,
     pub granted_authority: AuthoritySet,
@@ -114,6 +159,11 @@ impl AuthorityLeaseCertificate {
             mission_id: &'a MissionId,
             agent_id: &'a AgentId,
             parent_agent_id: &'a Option<AgentId>,
+            agent_identity_digest: &'a Digest,
+            issuer_identity_digest: &'a Digest,
+            issuer_key_id: &'a KeyId,
+            parent_lease: &'a Option<LeaseRef>,
+            renewed_from: &'a Option<LeaseRef>,
             organization_version: u64,
             policy_epoch: u64,
             granted_authority: AuthoritySet,
@@ -125,12 +175,17 @@ impl AuthorityLeaseCertificate {
         }
 
         canonical_bytes(
-            "aeon-authority-lease-certificate-v1",
+            "aeon-authority-lease-certificate-v2",
             &SigningPayload {
                 lease_id: &self.lease_id,
                 mission_id: &self.mission_id,
                 agent_id: &self.agent_id,
                 parent_agent_id: &self.parent_agent_id,
+                agent_identity_digest: &self.agent_identity_digest,
+                issuer_identity_digest: &self.issuer_identity_digest,
+                issuer_key_id: &self.issuer_key_id,
+                parent_lease: &self.parent_lease,
+                renewed_from: &self.renewed_from,
                 organization_version: self.organization_version,
                 policy_epoch: self.policy_epoch,
                 granted_authority: AuthoritySet {
@@ -170,6 +225,7 @@ impl AuthorityLeaseCertificate {
 #[serde(rename_all = "snake_case")]
 pub enum LeaseState {
     Active,
+    Paused,
     Revoked,
     Expired,
     Retired,
@@ -183,6 +239,7 @@ pub struct LeaseRecord {
     pub generation: u64,
     pub revoked_at: Option<DateTime<Utc>>,
     pub revocation_reason: Option<String>,
+    pub renewed_by: Option<LeaseId>,
 }
 
 impl LeaseRecord {
@@ -193,6 +250,7 @@ impl LeaseRecord {
             generation: 0,
             revoked_at: None,
             revocation_reason: None,
+            renewed_by: None,
         }
     }
 }

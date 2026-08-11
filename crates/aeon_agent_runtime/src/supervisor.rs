@@ -2,24 +2,21 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use chrono::{Duration, Utc};
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use chrono::{DateTime, Duration, Utc};
 use nexus::{Capability, HypervisorConfig, NexusHypervisor, ToolOutput};
-use rand::rngs::OsRng;
 
-use crate::execution::{
-    runtime_error, ActionGate, MetricCounters, NexusExecutionPort, RuntimeBinding,
-};
+use crate::execution::{runtime_error, ActionGate, MetricCounters, NexusExecutionPort};
 use crate::{
-    canonical_digest, resolved_system_instruction, ActionCertificate, AgentId, AgentLifecycle,
-    AgentMessage, AgentSpec, AuthorityLeaseCertificate, AuthoritySet, AuthorizationRecord,
-    BoundTool, CapabilityManifest, ContextResolver, ErrorCode, FinalResult, InMemoryMissionStore,
-    LeaseId, LeaseRecord, MissionEnvelope, MissionEventKind, ModelClient, ModelRequest,
-    PermissionSet, ProtocolGate, RegisteredTool, RuntimeError, SemanticContext, SignatureBytes,
-    ToolRegistry,
+    canonical_digest, resolved_system_instruction, ActionCertificate, AgentId, AgentMessage,
+    AgentSpec, AuthorityEvent, AuthorityKernel, AuthoritySet, AuthorizationRecord, BoundTool,
+    CapabilityManifest, ContextResolver, ErrorCode, FinalResult, InMemoryKeyCustody,
+    InMemoryMissionStore, KeyCustody, KeyId, LeaseId, LeaseRecord, LeaseSnapshot, MissionEnvelope,
+    MissionEventKind, ModelClient, ModelRequest, PermissionSet, ProtocolGate, RegisteredTool,
+    RenewalRequest, RootLeaseRequest, RuntimeError, SemanticContext, ToolRegistry,
 };
 
 pub use crate::execution::R1Metrics;
+pub type R2Runtime = R1Runtime;
 
 #[derive(Clone, Debug)]
 pub enum RunOutcome {
@@ -33,17 +30,14 @@ pub struct R1Runtime {
     spec: AgentSpec,
     model: Arc<dyn ModelClient>,
     registry: ToolRegistry,
-    semantic_context: RwLock<SemanticContext>,
-    runtime_binding: RuntimeBinding,
-    lease_certificate: AuthorityLeaseCertificate,
-    lease_record: LeaseRecord,
-    lease_verifying_key: VerifyingKey,
-    action_signing_key: SigningKey,
+    semantic_context: Arc<RwLock<SemanticContext>>,
+    authority_kernel: AuthorityKernel,
+    key_custody: Arc<InMemoryKeyCustody>,
     protocol_gate: ProtocolGate,
     action_gate: ActionGate,
     execution_port: NexusExecutionPort,
     metrics: Arc<MetricCounters>,
-    store: InMemoryMissionStore,
+    store: Arc<InMemoryMissionStore>,
     action_certificates: Mutex<Vec<ActionCertificate>>,
     steps_consumed: AtomicU64,
     actions_consumed: AtomicU64,
@@ -68,6 +62,29 @@ impl R1Runtime {
         model: Arc<dyn ModelClient>,
         registry: ToolRegistry,
         context_version: u64,
+    ) -> Result<Self, RuntimeError> {
+        Self::bootstrap_r2(
+            mission,
+            agent_id,
+            spec,
+            model,
+            registry,
+            context_version,
+            AuthoritySet {
+                capabilities: Vec::new(),
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn bootstrap_r2(
+        mission: MissionEnvelope,
+        agent_id: AgentId,
+        spec: AgentSpec,
+        model: Arc<dyn ModelClient>,
+        registry: ToolRegistry,
+        context_version: u64,
+        delegable_authority: AuthoritySet,
     ) -> Result<Self, RuntimeError> {
         let now = Utc::now();
         if !mission.active || mission.expires_at <= now {
@@ -94,12 +111,9 @@ impl R1Runtime {
                 "Capability::All is forbidden for synthesized agents",
             ));
         }
-        if spec
-            .requested_authority
-            .capabilities
-            .iter()
-            .any(|capability| !mission.allowed_capabilities.contains(capability))
-        {
+        let mission_authority = AuthoritySet::new(mission.allowed_capabilities.clone())?;
+        let requested_authority = AuthoritySet::new(spec.requested_authority.capabilities.clone())?;
+        if !requested_authority.is_subset_of(&mission_authority) {
             return Err(runtime_error(
                 ErrorCode::CapabilityOutsideAuthority,
                 "requested authority exceeds the mission envelope",
@@ -122,11 +136,9 @@ impl R1Runtime {
         let semantic_context = resolver.resolve(&spec, &registry)?;
         let semantic_context_digest = semantic_context.canonical_digest()?;
 
-        let mut bound_tools = Vec::with_capacity(spec.requested_tools.len());
         let mut approved_tools = Vec::with_capacity(spec.requested_tools.len());
         for tool_id in &spec.requested_tools {
             let tool_digest = registry.resolve(tool_id)?.manifest_digest()?;
-            bound_tools.push((tool_id.clone(), tool_digest));
             approved_tools.push(BoundTool {
                 tool_id: tool_id.clone(),
                 tool_manifest_digest: tool_digest,
@@ -147,49 +159,45 @@ impl R1Runtime {
             runtime_config_digest,
             tool_registry_root_digest: semantic_context.tool_registry_root_digest,
         };
-        let capability_manifest_digest = capability_manifest.canonical_digest()?;
-
-        let lease_id = LeaseId::new(format!("lease-{}", uuid::Uuid::new_v4()))?;
         let lease_expiry = std::cmp::min(mission.expires_at, now + Duration::minutes(5));
-        let mut lease_certificate = AuthorityLeaseCertificate {
-            lease_id: lease_id.clone(),
-            mission_id: mission.mission_id.clone(),
-            agent_id: agent_id.clone(),
-            parent_agent_id: None,
-            organization_version: mission.organization_version,
-            policy_epoch: mission.policy_epoch,
-            granted_authority: AuthoritySet {
-                capabilities: spec.requested_authority.capabilities.clone(),
+        let key_custody = Arc::new(InMemoryKeyCustody::generate(KeyId::new(format!(
+            "key-{}",
+            uuid::Uuid::new_v4()
+        ))?)?);
+        let kernel_custody: Arc<dyn KeyCustody> = key_custody.clone();
+        let authority_kernel = AuthorityKernel::bootstrap(
+            RootLeaseRequest {
+                mission: mission.clone(),
+                agent_id: agent_id.clone(),
+                granted_authority: AuthoritySet {
+                    capabilities: spec.requested_authority.capabilities.clone(),
+                },
+                delegable_authority,
+                capability_manifest,
+                semantic_context_digest,
+                expires_at: lease_expiry,
             },
-            delegable_authority: AuthoritySet {
-                capabilities: Vec::new(),
-            },
-            capability_manifest_digest,
-            semantic_context_digest,
-            issued_at: now,
-            expires_at: lease_expiry,
-            signature: SignatureBytes::new(Vec::new()),
-        };
-        let action_signing_key = SigningKey::generate(&mut OsRng);
-        let lease_verifying_key = action_signing_key.verifying_key();
-        let signature = action_signing_key.sign(&lease_certificate.signing_payload()?);
-        lease_certificate.signature = SignatureBytes::new(signature.to_bytes().to_vec());
-
-        let runtime_binding = RuntimeBinding {
-            agent_id: agent_id.clone(),
-            lifecycle: AgentLifecycle::Active,
-            lease_id: lease_id.clone(),
-            semantic_context_digest,
-            bound_tools,
-        };
-        let lease_record = LeaseRecord::active(lease_id);
+            kernel_custody.clone(),
+            now,
+        )?;
 
         let metrics = Arc::new(MetricCounters::default());
-        let hypervisor = NexusHypervisor::new(HypervisorConfig::default())
-            .map_err(|error| runtime_error(ErrorCode::ExecutionFailed, error.to_string()))?;
-        let execution_port = NexusExecutionPort::new(hypervisor, registry.clone(), metrics.clone());
+        let hypervisor_config = HypervisorConfig::default();
+        NexusHypervisor::new(hypervisor_config.clone()).map_err(|_| {
+            runtime_error(ErrorCode::ExecutionFailed, "Nexus initialization failed")
+        })?;
+        let semantic_context = Arc::new(RwLock::new(semantic_context));
+        let store = Arc::new(InMemoryMissionStore::new(mission.clone()));
+        let execution_port = NexusExecutionPort::new(
+            hypervisor_config,
+            registry.clone(),
+            authority_kernel.clone(),
+            semantic_context.clone(),
+            store.clone(),
+            kernel_custody,
+            metrics.clone(),
+        );
 
-        let store = InMemoryMissionStore::new(mission.clone());
         store.append(MissionEventKind::MissionCreated);
         store.append(MissionEventKind::ContextResolved);
         store.append(MissionEventKind::LeaseIssued);
@@ -201,12 +209,9 @@ impl R1Runtime {
             spec,
             model,
             registry,
-            semantic_context: RwLock::new(semantic_context),
-            runtime_binding,
-            lease_certificate,
-            lease_record,
-            lease_verifying_key,
-            action_signing_key,
+            semantic_context,
+            authority_kernel,
+            key_custody,
             protocol_gate: ProtocolGate::default(),
             action_gate: ActionGate,
             execution_port,
@@ -219,6 +224,7 @@ impl R1Runtime {
     }
 
     pub async fn run_once(&self) -> Result<RunOutcome, RuntimeError> {
+        self.validate_live_authority(Utc::now())?;
         reserve_budget(
             &self.steps_consumed,
             self.spec.resource_budget.max_steps,
@@ -261,17 +267,17 @@ impl R1Runtime {
             AgentMessage::ToolCall(proposal) => {
                 self.store.append(MissionEventKind::PlanAccepted);
                 self.metrics.action_gate_call();
+                let active_lease_id = self.authority_kernel.root_lease_id()?;
                 let authorized = self.action_gate.authorize(
                     &self.mission,
-                    &self.runtime_binding,
-                    &self.lease_certificate,
-                    &self.lease_record,
+                    &self.agent_id,
+                    &self.authority_kernel,
+                    &active_lease_id,
                     &semantic_context,
                     &self.registry,
                     &proposal.tool_id,
                     &proposal.arguments,
-                    &self.lease_verifying_key,
-                    &self.action_signing_key,
+                    self.key_custody.as_ref(),
                     Utc::now(),
                 );
                 let (authorized_execution, artifact) = match authorized {
@@ -302,25 +308,22 @@ impl R1Runtime {
                         runtime_error(ErrorCode::Internal, "certificate ledger lock poisoned")
                     })?
                     .push(artifact.certificate);
-                self.store.consume_authorization(
-                    &artifact.record.record_id,
-                    artifact.record.generation,
-                )?;
-                self.store.append(MissionEventKind::AuthorizationConsumed);
 
                 let output = match self
                     .execution_port
-                    .execute(authorized_execution, || {
-                        self.store.append(MissionEventKind::ExecutionStarted)
-                    })
+                    .execute(
+                        authorized_execution,
+                        || self.store.append(MissionEventKind::AuthorizationConsumed),
+                        || self.store.append(MissionEventKind::ExecutionStarted),
+                    )
                     .await
                 {
                     Ok(output) => output,
                     Err(error) => {
-                        if error.code() == ErrorCode::ToolManifestMismatch {
+                        if error.code() != ErrorCode::ExecutionFailed {
                             self.store
                                 .append(MissionEventKind::ExecutionRejectedBeforeNexus(
-                                    ErrorCode::ToolManifestMismatch,
+                                    error.code(),
                                 ));
                         } else {
                             self.store
@@ -350,11 +353,11 @@ impl R1Runtime {
     }
 
     /// Snapshot the immutable action certificates retained by the R1 in-memory ledger.
-    pub fn authorization_certificates(&self) -> Vec<ActionCertificate> {
+    pub fn authorization_certificates(&self) -> Result<Vec<ActionCertificate>, RuntimeError> {
         self.action_certificates
             .lock()
             .map(|certificates| certificates.clone())
-            .unwrap_or_default()
+            .map_err(|_| runtime_error(ErrorCode::Internal, "certificate ledger lock poisoned"))
     }
 
     /// Snapshot mutable authorization consumption state separately from certificates.
@@ -377,6 +380,82 @@ impl R1Runtime {
             .clone()
     }
 
+    pub fn active_lease_snapshot(&self) -> Result<LeaseSnapshot, RuntimeError> {
+        let active_lease_id = self.authority_kernel.root_lease_id()?;
+        self.authority_kernel.lease_snapshot(&active_lease_id)
+    }
+
+    pub fn lease_snapshot(&self, lease_id: &LeaseId) -> Result<LeaseSnapshot, RuntimeError> {
+        self.authority_kernel.lease_snapshot(lease_id)
+    }
+
+    pub fn authority_events(&self) -> Result<Vec<AuthorityEvent>, RuntimeError> {
+        self.authority_kernel.events()
+    }
+
+    pub fn pause(&self) -> Result<LeaseRecord, RuntimeError> {
+        let active = self.active_lease_snapshot()?;
+        self.authority_kernel.pause(
+            &active.certificate.lease_id,
+            active.record.generation,
+            Utc::now(),
+        )
+    }
+
+    pub fn resume(&self) -> Result<LeaseRecord, RuntimeError> {
+        let active = self.active_lease_snapshot()?;
+        self.authority_kernel.resume(
+            &active.certificate.lease_id,
+            active.record.generation,
+            Utc::now(),
+        )
+    }
+
+    pub fn revoke(&self, reason: impl Into<String>) -> Result<Vec<LeaseId>, RuntimeError> {
+        let active = self.active_lease_snapshot()?;
+        self.authority_kernel.revoke(
+            &active.certificate.lease_id,
+            active.record.generation,
+            reason,
+            Utc::now(),
+        )
+    }
+
+    pub fn renew(&self, expires_at: DateTime<Utc>) -> Result<LeaseSnapshot, RuntimeError> {
+        let active = self.active_lease_snapshot()?;
+        let selected_tool = self.spec.requested_tools.first().ok_or_else(|| {
+            runtime_error(
+                ErrorCode::InvalidInput,
+                "lease renewal requires at least one manifest-bound tool",
+            )
+        })?;
+        let (_, live_manifest) = self
+            .registry
+            .resolve_with_capability_manifest(selected_tool, &active.manifest)?;
+        let semantic_context_digest = self
+            .semantic_context
+            .read()
+            .map_err(|_| runtime_error(ErrorCode::Internal, "semantic context lock poisoned"))?
+            .canonical_digest()?;
+        let renewed_id = self.authority_kernel.renew(
+            RenewalRequest {
+                lease_id: active.certificate.lease_id,
+                expected_generation: active.record.generation,
+                granted_authority: active.certificate.granted_authority,
+                delegable_authority: active.certificate.delegable_authority,
+                capability_manifest: live_manifest,
+                semantic_context_digest,
+                expires_at,
+            },
+            Utc::now(),
+        )?;
+        self.authority_kernel.lease_snapshot(&renewed_id)
+    }
+
+    pub fn refresh_expirations(&self) -> Result<Vec<LeaseId>, RuntimeError> {
+        self.authority_kernel.refresh_expirations(Utc::now())
+    }
+
     pub fn replace_semantic_context(
         &self,
         semantic_context: SemanticContext,
@@ -392,11 +471,25 @@ impl R1Runtime {
     pub fn replace_registered_tool(&self, tool: RegisteredTool) -> Result<(), RuntimeError> {
         self.registry.replace(tool)
     }
+
+    fn validate_live_authority(&self, now: DateTime<Utc>) -> Result<(), RuntimeError> {
+        let active = self.active_lease_snapshot()?;
+        self.authority_kernel.validate_active_chain(
+            &active.certificate.lease_id,
+            Some(active.record.generation),
+            &active.manifest,
+            now,
+        )?;
+        Ok(())
+    }
 }
 
 fn is_capability_all(capability: &Capability) -> bool {
     capability == &Capability::All
 }
+
+#[cfg(test)]
+mod tests;
 
 fn reserve_budget(counter: &AtomicU64, limit: u64, budget_name: &str) -> Result<(), RuntimeError> {
     counter

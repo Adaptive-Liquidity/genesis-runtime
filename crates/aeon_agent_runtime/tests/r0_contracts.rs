@@ -4,10 +4,10 @@ use aeon_agent_runtime::{
     canonical_digest, validate_context_continuation, ActionCertificate, AgentId, AgentSpec,
     AuthorityRequest, AuthoritySet, AuthorizationId, AuthorizationState, BoundTool, Budget,
     CanonicalAction, CanonicalJson, CapabilityManifest, CertificateId, ContextTransition, Contract,
-    Digest, EffectClass, EffectState, InstructionProfileRef, LeaseId, LeaseRecord, LeaseState,
-    MemoryRef, MissionId, ModelRef, Objective, PermissionSet, ProtocolGate, ResourceRequest,
-    RetrievalIndexRef, Role, SemanticContext, SemanticRequirements, SemanticScope, ToolId,
-    ToolManifest,
+    Digest, EffectClass, EffectState, InstructionProfileRef, KeyId, LeaseId, LeaseRecord,
+    LeaseState, MemoryRef, MissionId, ModelRef, Objective, PermissionSet, ProtocolGate,
+    ResourceRequest, RetrievalIndexRef, Role, SemanticContext, SemanticRequirements, SemanticScope,
+    ToolId, ToolManifest,
 };
 use chrono::{Duration, TimeZone, Utc};
 use ed25519_dalek::{Signer, SigningKey};
@@ -183,7 +183,30 @@ fn tool_and_capability_manifest_digests_are_canonical_and_binding() {
         manifest(vec![bound_a.clone(), bound_b.clone()])
             .canonical_digest()
             .unwrap(),
-        manifest(vec![bound_b, bound_a]).canonical_digest().unwrap()
+        manifest(vec![bound_b.clone(), bound_a.clone()])
+            .canonical_digest()
+            .unwrap()
+    );
+
+    let same_duplicate = manifest(vec![bound_a.clone(), bound_a.clone()])
+        .canonical_digest()
+        .unwrap_err();
+    assert_eq!(
+        same_duplicate.code(),
+        aeon_agent_runtime::ErrorCode::CapabilityManifestMismatch
+    );
+    let conflicting_duplicate = manifest(vec![
+        bound_a.clone(),
+        BoundTool {
+            tool_id: bound_a.tool_id,
+            tool_manifest_digest: digest("different-a"),
+        },
+    ])
+    .canonical_digest()
+    .unwrap_err();
+    assert_eq!(
+        conflicting_duplicate.code(),
+        aeon_agent_runtime::ErrorCode::CapabilityManifestMismatch
     );
 }
 
@@ -255,6 +278,11 @@ fn lease_state_is_separate_from_signed_certificate_payload() {
         mission_id: MissionId::new("mission-1").unwrap(),
         agent_id: AgentId::new("agent-1").unwrap(),
         parent_agent_id: None,
+        agent_identity_digest: digest("agent-identity"),
+        issuer_identity_digest: digest("issuer-identity"),
+        issuer_key_id: KeyId::new("key-issuer").unwrap(),
+        parent_lease: None,
+        renewed_from: None,
         organization_version: 1,
         policy_epoch: 7,
         granted_authority: AuthoritySet {
@@ -277,6 +305,7 @@ fn lease_state_is_separate_from_signed_certificate_payload() {
         generation: 9,
         revoked_at: Some(issued_at),
         revocation_reason: Some("test revocation".into()),
+        renewed_by: None,
     };
     assert_ne!(
         serde_json::to_value(active).unwrap(),
@@ -295,6 +324,11 @@ fn lease_certificate_signature_detects_signed_field_mutation() {
         mission_id: MissionId::new("mission-1").unwrap(),
         agent_id: AgentId::new("agent-1").unwrap(),
         parent_agent_id: None,
+        agent_identity_digest: digest("agent-identity"),
+        issuer_identity_digest: digest("issuer-identity"),
+        issuer_key_id: KeyId::new("key-issuer").unwrap(),
+        parent_lease: None,
+        renewed_from: None,
         organization_version: 1,
         policy_epoch: 7,
         granted_authority: AuthoritySet {

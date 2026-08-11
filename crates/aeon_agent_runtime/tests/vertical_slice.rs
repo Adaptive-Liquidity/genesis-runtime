@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use aeon_agent_runtime::{
-    AgentId, AgentSpec, AuthorityRequest, Contract, EffectClass, ErrorCode, InstructionProfileRef,
-    MemoryRef, MissionEnvelope, MissionEventKind, MissionId, ModelRef, Objective, R1Runtime,
-    RegisteredTool, ResourceRequest, RetrievalIndexRef, Role, RunOutcome, ScriptedModelClient,
-    SemanticRequirements, ToolId, ToolRegistry,
+    AgentId, AgentSpec, AuthorityEventKind, AuthorityRequest, Contract, EffectClass, ErrorCode,
+    InstructionProfileRef, MemoryRef, MissionEnvelope, MissionEventKind, MissionId, ModelRef,
+    Objective, R1Runtime, R2Runtime, RegisteredTool, ResourceRequest, RetrievalIndexRef, Role,
+    RunOutcome, ScriptedModelClient, SemanticRequirements, ToolId, ToolRegistry,
 };
 use chrono::{Duration, Utc};
 use nexus::Capability;
@@ -484,4 +484,159 @@ async fn model_facing_structures_never_receive_tokens_or_wasm() {
     assert!(!trace.contains("bearer"));
     assert!(!trace.contains("wasm_bytes"));
     assert_eq!(runtime.metrics().token_issues, 1);
+}
+
+#[tokio::test]
+async fn r2_pause_before_run_rejects_without_issuing_tokens_or_entering_nexus() {
+    let cap = Capability::MemoryPreview;
+    let raw = tool_call(FIXTURE_TOOL_ID);
+    let (runtime, _) = runtime(
+        &raw,
+        mission(vec![FIXTURE_TOOL_ID], vec![cap.clone()]),
+        spec(vec![cap.clone()]),
+        vec![fixture_tool(FIXTURE_TOOL_ID, 1, vec![cap])],
+    );
+
+    runtime.pause().unwrap();
+    let error = runtime.run_once().await.unwrap_err();
+    assert_eq!(error.code(), ErrorCode::LeaseInactive);
+    assert_eq!(
+        (
+            runtime.metrics().token_issues,
+            runtime.metrics().nexus_executions
+        ),
+        (0, 0)
+    );
+    assert!(runtime
+        .authority_events()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == AuthorityEventKind::LeasePaused));
+}
+
+#[tokio::test]
+async fn r2_revoke_before_run_rejects_without_issuing_tokens_or_entering_nexus() {
+    let cap = Capability::MemoryPreview;
+    let raw = tool_call(FIXTURE_TOOL_ID);
+    let (runtime, _) = runtime(
+        &raw,
+        mission(vec![FIXTURE_TOOL_ID], vec![cap.clone()]),
+        spec(vec![cap.clone()]),
+        vec![fixture_tool(FIXTURE_TOOL_ID, 1, vec![cap])],
+    );
+
+    runtime.revoke("test principal revocation").unwrap();
+    let error = runtime.run_once().await.unwrap_err();
+    assert_eq!(error.code(), ErrorCode::LeaseInactive);
+    assert_eq!(
+        (
+            runtime.metrics().token_issues,
+            runtime.metrics().nexus_executions
+        ),
+        (0, 0)
+    );
+    assert!(runtime
+        .authority_events()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == AuthorityEventKind::LeaseRevoked));
+}
+
+#[tokio::test]
+async fn r2_renewal_switches_immutable_lease_and_new_lease_executes() {
+    let cap = Capability::MemoryPreview;
+    let raw = tool_call(FIXTURE_TOOL_ID);
+    let (runtime, _) = runtime(
+        &raw,
+        mission(vec![FIXTURE_TOOL_ID], vec![cap.clone()]),
+        spec(vec![cap.clone()]),
+        vec![fixture_tool(FIXTURE_TOOL_ID, 1, vec![cap])],
+    );
+    let runtime: R2Runtime = runtime;
+    let original = runtime.active_lease_snapshot().unwrap();
+
+    let renewed = runtime.renew(Utc::now() + Duration::minutes(4)).unwrap();
+    assert_ne!(renewed.certificate.lease_id, original.certificate.lease_id);
+    assert_eq!(
+        renewed
+            .certificate
+            .renewed_from
+            .as_ref()
+            .map(|reference| &reference.lease_id),
+        Some(&original.certificate.lease_id)
+    );
+    let retired = runtime
+        .lease_snapshot(&original.certificate.lease_id)
+        .unwrap();
+    assert_eq!(retired.certificate, original.certificate);
+    assert_eq!(
+        retired.record.state,
+        aeon_agent_runtime::LeaseState::Retired
+    );
+
+    assert!(matches!(
+        runtime.run_once().await.unwrap(),
+        RunOutcome::Executed(_)
+    ));
+    assert_eq!(
+        (
+            runtime.metrics().token_issues,
+            runtime.metrics().nexus_executions
+        ),
+        (1, 1)
+    );
+    assert!(runtime
+        .authority_events()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == AuthorityEventKind::LeaseRenewed));
+}
+
+#[tokio::test]
+async fn t11_drift_rejects_execution_then_renewal_without_changing_original_lease() {
+    let cap = Capability::MemoryPreview;
+    let raw = tool_call(FIXTURE_TOOL_ID);
+    let (runtime, _) = runtime(
+        &raw,
+        mission(vec![FIXTURE_TOOL_ID], vec![cap.clone()]),
+        spec(vec![cap.clone()]),
+        vec![fixture_tool(FIXTURE_TOOL_ID, 1, vec![cap])],
+    );
+    let original = runtime.active_lease_snapshot().unwrap();
+    let mut drifted = runtime.semantic_context();
+    drifted.policy_epoch += 1;
+    runtime.replace_semantic_context(drifted).unwrap();
+
+    let execution_error = runtime.run_once().await.unwrap_err();
+    assert_eq!(execution_error.code(), ErrorCode::SemanticContextChanged);
+    let renewal_error = runtime
+        .renew(Utc::now() + Duration::minutes(4))
+        .unwrap_err();
+    assert_eq!(renewal_error.code(), ErrorCode::SemanticContextChanged);
+    assert_eq!(runtime.active_lease_snapshot().unwrap(), original);
+    assert!(!runtime
+        .authority_events()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == AuthorityEventKind::LeaseRenewed));
+}
+
+#[test]
+fn same_context_renewal_retains_the_original_semantic_binding() {
+    let cap = Capability::MemoryPreview;
+    let raw = tool_call(FIXTURE_TOOL_ID);
+    let (runtime, _) = runtime(
+        &raw,
+        mission(vec![FIXTURE_TOOL_ID], vec![cap.clone()]),
+        spec(vec![cap.clone()]),
+        vec![fixture_tool(FIXTURE_TOOL_ID, 1, vec![cap])],
+    );
+    let original = runtime.active_lease_snapshot().unwrap();
+
+    let renewed = runtime.renew(Utc::now() + Duration::minutes(4)).unwrap();
+
+    assert_eq!(
+        renewed.certificate.semantic_context_digest,
+        original.certificate.semantic_context_digest
+    );
 }

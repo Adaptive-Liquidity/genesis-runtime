@@ -2,13 +2,13 @@
 
 ## Stage control
 
-Only R0 and R1 are active. The required control point is: complete their evidence, validate, and stop before R2. A later stage is a target, not an implemented feature or inherited security claim.
+R0-R2 are active. The required control point is: complete their evidence, validate, and stop before R3. A later stage is a target, not an implemented feature or inherited security claim.
 
 | Stage | Target | Status in this workspace |
 | --- | --- | --- |
-| R0 | Architecture and core types | Active: contract/type evidence |
-| R1 | Single-agent secure vertical slice | Active: fixed one-agent/one-tool evidence |
-| R2 | Full authority lifecycle and delegation | Not active |
+| R0 | Architecture and core types | Implemented/tested: contract/type evidence |
+| R1 | Single-agent secure vertical slice | Implemented/tested: fixed one-agent/one-tool evidence |
+| R2 | Full authority lifecycle and delegation | Implemented/tested: in-memory identity, chain, lifecycle, and live revalidation evidence |
 | R3 | Durable MissionStore | Not active |
 | R4 | Real model integration and typed protocol | Not active |
 | R5 | Dynamic Agent Synthesis | Not active |
@@ -25,6 +25,8 @@ Only R0 and R1 are active. The required control point is: complete their evidenc
 | R16 | Repair | Not active |
 | R17 | Self-modification | Not active |
 | R18 | Constrained decoding | Not active |
+
+Future R5 design note: Dynamic Genesis specialist synthesis will require an explicit policy for mission-approved per-agent model/runtime specialization while preserving authority non-amplification. That policy and implementation are not part of R2.
 
 ## R0 acceptance evidence
 
@@ -60,10 +62,23 @@ The validation command is:
 cargo test --workspace --all-targets
 ```
 
-The checkpoint report must record the exact Nexus revision, test command, result, and any untested or blocked surface. If the command does not pass, R0/R1 are not validated.
+The checkpoint report must record the exact Nexus revision, test command, result, and any untested or blocked surface. If the command does not pass, R0-R2 are not validated.
 
-## Stop gate before R2
+## R2 acceptance evidence
 
-Do not start R2 merely because R0/R1 types anticipate later state. Before activating R2, review the R0/R1 evidence for contradictions and explicitly approve the next stage.
+R2 adds a deliberately in-memory authority layer:
 
-At this stop gate, the project still makes no durability, crash-recovery, exactly-once, full delegation/revocation, IFC/MAC, multi-agent/coalition, formal-verification, or production-readiness claim.
+1. Bind signed agent identities to issuer identity and key identifiers without exposing signing material through serialization or debug output.
+2. Bind every immutable lease certificate to its subject, issuer, exact parent or renewal predecessor, mission, organization version, policy epoch, semantic context, and full capability manifest.
+3. Validate transitive capability and tool attenuation across the entire live chain; reject `Capability::All`.
+4. Bound authority and identity chains to the trusted kernel maximum, independently of future mission spawn topology.
+5. Maintain generation-checked in-memory pause, resume, expiry, cascading revocation, and immutable same-context renewal records. Renewal cannot reauthorize semantic-context drift.
+6. Revalidate every observed generation, chain signature, semantic context, and atomic registry manifest snapshot immediately before issuing Nexus tokens and consuming authorization.
+7. Keep final validation, synchronous token issuance, and single-use consumption under one authority guard as the authorization commit section: a prior revocation rejects, while a later revocation governs future calls and does not cancel an already-started Nexus execution.
+8. Use a fresh Nexus hypervisor per execution so its bearer-token state is not retained after the call. Snapshot identifiers from one call are consequently not reusable in another.
+
+## Stop gate before R3
+
+Do not infer persistence from the R2 in-memory authority ledger or event stream. R3 requires separate approval and must add crash-safe storage and recovery evidence.
+
+At this stop gate, the project still makes no durability, crash-recovery, exactly-once, distributed revocation, IFC/MAC, multi-agent/coalition, formal-verification, or production-readiness claim.

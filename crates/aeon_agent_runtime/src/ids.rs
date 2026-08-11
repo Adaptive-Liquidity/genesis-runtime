@@ -97,6 +97,7 @@ string_id!(AgentId, "agent id");
 string_id!(LeaseId, "lease id");
 string_id!(AuthorizationId, "authorization id");
 string_id!(CertificateId, "certificate id");
+string_id!(KeyId, "key id");
 string_id!(ToolId, "tool id");
 string_id!(ModelRef, "model reference");
 string_id!(MemoryRef, "memory reference");

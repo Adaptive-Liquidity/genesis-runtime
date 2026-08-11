@@ -1,18 +1,17 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use nexus::{Capability, NexusHypervisor, ToolOutput};
+use ed25519_dalek::{Signature, Verifier};
+use nexus::{Capability, HypervisorConfig, NexusHypervisor, ToolOutput};
 use serde_json::Value;
 
 use crate::{
-    canonical_digest, ActionCertificate, AgentId, AgentLifecycle, AuthorityLeaseCertificate,
-    AuthorizationId, AuthorizationRecord, AuthorizationState, Budget, CanonicalAction,
-    CanonicalJson, CertificateId, Digest, ErrorCode, LeaseId, LeaseRecord, LeaseRef, LeaseState,
-    MissionEnvelope, RuntimeError, SemanticContext, SemanticScope, SignatureBytes, ToolId,
-    ToolRegistry,
+    canonical_digest, ActionCertificate, AgentId, AuthorityKernel, AuthoritySet, AuthorizationId,
+    AuthorizationRecord, AuthorizationState, Budget, CanonicalAction, CanonicalJson,
+    CapabilityManifest, CertificateId, Digest, ErrorCode, InMemoryMissionStore, KeyCustody,
+    LeaseId, MissionEnvelope, RuntimeError, SemanticContext, SemanticScope, ToolId, ToolRegistry,
 };
 
 const TOKEN_VALIDITY: Duration = Duration::from_secs(30);
@@ -75,20 +74,14 @@ impl MetricCounters {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RuntimeBinding {
-    pub agent_id: AgentId,
-    pub lifecycle: AgentLifecycle,
-    pub lease_id: LeaseId,
-    pub semantic_context_digest: Digest,
-    pub bound_tools: Vec<(ToolId, Digest)>,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct AuthorizedExecution {
     pub tool_id: ToolId,
     pub arguments: Value,
     pub tool_manifest_digest: Digest,
     pub required_capabilities: Vec<Capability>,
+    pub capability_manifest: CapabilityManifest,
+    pub certificate: ActionCertificate,
+    pub observed_generations: Vec<(LeaseId, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,63 +98,20 @@ impl ActionGate {
     pub(crate) fn authorize(
         &self,
         mission: &MissionEnvelope,
-        binding: &RuntimeBinding,
-        lease_certificate: &AuthorityLeaseCertificate,
-        lease_record: &LeaseRecord,
+        agent_id: &AgentId,
+        authority_kernel: &AuthorityKernel,
+        lease_id: &LeaseId,
         current_context: &SemanticContext,
         registry: &ToolRegistry,
         proposal_tool_id: &ToolId,
         arguments: &Value,
-        lease_verifying_key: &VerifyingKey,
-        signing_key: &SigningKey,
+        key_custody: &dyn KeyCustody,
         now: DateTime<Utc>,
     ) -> Result<(AuthorizedExecution, R1AuthorizationArtifact), RuntimeError> {
         if !mission.active || mission.expires_at <= now {
             return Err(runtime_error(
                 ErrorCode::MissionInactive,
                 "mission is inactive or expired",
-            ));
-        }
-        if binding.lifecycle != AgentLifecycle::Active {
-            return Err(runtime_error(
-                ErrorCode::AgentInactive,
-                "agent is not executable",
-            ));
-        }
-        if lease_certificate.lease_id != binding.lease_id {
-            return Err(runtime_error(
-                ErrorCode::LeaseInactive,
-                "runtime lease binding is missing",
-            ));
-        }
-        if lease_record.lease_id != binding.lease_id
-            || lease_record.state != LeaseState::Active
-            || lease_certificate.expires_at <= now
-        {
-            return Err(runtime_error(
-                ErrorCode::LeaseInactive,
-                "authority lease is inactive or expired",
-            ));
-        }
-        lease_certificate.verify_signature(lease_verifying_key)?;
-        if lease_certificate.mission_id != mission.mission_id
-            || lease_certificate.agent_id != binding.agent_id
-            || lease_certificate.organization_version != mission.organization_version
-            || lease_certificate.policy_epoch != mission.policy_epoch
-        {
-            return Err(runtime_error(
-                ErrorCode::AuthorizationInvalid,
-                "lease bindings do not match current runtime state",
-            ));
-        }
-
-        let current_context_digest = current_context.canonical_digest()?;
-        if current_context_digest != binding.semantic_context_digest
-            || current_context_digest != lease_certificate.semantic_context_digest
-        {
-            return Err(runtime_error(
-                ErrorCode::SemanticContextChanged,
-                "semantic context changed after authorization",
             ));
         }
         if !mission.allowed_tools.contains(proposal_tool_id) {
@@ -171,23 +121,51 @@ impl ActionGate {
             ));
         }
 
-        let registered_tool = registry.resolve(proposal_tool_id)?;
+        let lease_snapshot = authority_kernel.lease_snapshot(lease_id)?;
+        let (registered_tool, live_manifest) = registry
+            .resolve_with_capability_manifest(proposal_tool_id, &lease_snapshot.manifest)?;
         let current_manifest_digest = registered_tool.manifest_digest()?;
-        let authorized_manifest_digest = binding
-            .bound_tools
+        let authorized_manifest_digest = lease_snapshot
+            .manifest
+            .approved_tools
             .iter()
-            .find(|(tool_id, _)| tool_id == proposal_tool_id)
-            .map(|(_, digest)| digest)
+            .find(|bound| &bound.tool_id == proposal_tool_id)
+            .map(|bound| bound.tool_manifest_digest)
             .ok_or_else(|| {
                 runtime_error(
                     ErrorCode::ToolManifestMismatch,
                     "tool was not bound at activation",
                 )
             })?;
-        if authorized_manifest_digest != &current_manifest_digest {
+        if authorized_manifest_digest != current_manifest_digest {
             return Err(runtime_error(
                 ErrorCode::ToolManifestMismatch,
                 "registered tool no longer matches its authorized manifest",
+            ));
+        }
+
+        let validated_authority = authority_kernel.validate_active_chain(
+            lease_id,
+            Some(lease_snapshot.record.generation),
+            &live_manifest,
+            now,
+        )?;
+        if lease_snapshot.certificate.agent_id != *agent_id
+            || lease_snapshot.certificate.mission_id != mission.mission_id
+            || lease_snapshot.certificate.organization_version != mission.organization_version
+            || lease_snapshot.certificate.policy_epoch != mission.policy_epoch
+        {
+            return Err(runtime_error(
+                ErrorCode::AuthorizationInvalid,
+                "active authority does not match the runtime binding",
+            ));
+        }
+
+        let current_context_digest = current_context.canonical_digest()?;
+        if current_context_digest != validated_authority.semantic_context_digest {
+            return Err(runtime_error(
+                ErrorCode::SemanticContextChanged,
+                "semantic context changed after authority issuance",
             ));
         }
 
@@ -202,12 +180,13 @@ impl ActionGate {
                 "Capability::All is forbidden for synthesized agents",
             ));
         }
+        let mission_authority = AuthoritySet::new(mission.allowed_capabilities.clone())?;
         if required_capabilities.iter().any(|capability| {
-            !mission.allowed_capabilities.contains(capability)
-                || !lease_certificate
+            !mission_authority.covers(capability)
+                || !lease_snapshot
+                    .certificate
                     .granted_authority
-                    .capabilities
-                    .contains(capability)
+                    .covers(capability)
         }) {
             return Err(runtime_error(
                 ErrorCode::CapabilityOutsideAuthority,
@@ -229,8 +208,8 @@ impl ActionGate {
         let mut certificate = ActionCertificate::unsigned_fixture(
             certificate_id,
             mission.mission_id.clone(),
-            binding.agent_id.clone(),
-            binding.lease_id.clone(),
+            agent_id.clone(),
+            lease_id.clone(),
             action_ref,
             proposal_tool_id.clone(),
             current_manifest_digest,
@@ -238,25 +217,20 @@ impl ActionGate {
             authorization_id,
             now,
         );
+        certificate.agent_identity_digest = validated_authority.agent_identity_digest;
         certificate.organization_version = mission.organization_version;
         certificate.policy_epoch = mission.policy_epoch;
         certificate.semantic_context_digest = current_context_digest;
-        certificate.expires_at =
-            std::cmp::min(certificate.expires_at, lease_certificate.expires_at);
-        let certificate_signature = signing_key.sign(&certificate.signing_payload()?);
-        certificate.signature = SignatureBytes::new(certificate_signature.to_bytes().to_vec());
+        certificate.expires_at = std::cmp::min(
+            certificate.expires_at,
+            lease_snapshot.certificate.expires_at,
+        );
+        certificate.signature = key_custody.sign(&certificate.signing_payload()?)?;
 
-        let lease_certificate_digest = canonical_digest(
-            "aeon-authority-lease-certificate-record-v1",
-            lease_certificate,
-        )?;
         let authorization_record = AuthorizationRecord {
             record_id: certificate.authorization_record_id.clone(),
             action_ref,
-            authority_chain: vec![LeaseRef {
-                lease_id: binding.lease_id.clone(),
-                certificate_digest: lease_certificate_digest,
-            }],
+            authority_chain: validated_authority.chain,
             total_budget: Budget { actions: 1 },
             remaining_budget: Budget { actions: 1 },
             state: AuthorizationState::Issued,
@@ -271,6 +245,9 @@ impl ActionGate {
                 arguments: arguments.clone(),
                 tool_manifest_digest: current_manifest_digest,
                 required_capabilities,
+                capability_manifest: live_manifest,
+                certificate: certificate.clone(),
+                observed_generations: validated_authority.observed_generations,
             },
             R1AuthorizationArtifact {
                 certificate,
@@ -281,20 +258,32 @@ impl ActionGate {
 }
 
 pub(crate) struct NexusExecutionPort {
-    hypervisor: NexusHypervisor,
+    hypervisor_config: HypervisorConfig,
     registry: ToolRegistry,
+    authority_kernel: AuthorityKernel,
+    semantic_context: Arc<RwLock<SemanticContext>>,
+    store: Arc<InMemoryMissionStore>,
+    key_custody: Arc<dyn KeyCustody>,
     metrics: Arc<MetricCounters>,
 }
 
 impl NexusExecutionPort {
     pub(crate) fn new(
-        hypervisor: NexusHypervisor,
+        hypervisor_config: HypervisorConfig,
         registry: ToolRegistry,
+        authority_kernel: AuthorityKernel,
+        semantic_context: Arc<RwLock<SemanticContext>>,
+        store: Arc<InMemoryMissionStore>,
+        key_custody: Arc<dyn KeyCustody>,
         metrics: Arc<MetricCounters>,
     ) -> Self {
         Self {
-            hypervisor,
+            hypervisor_config,
             registry,
+            authority_kernel,
+            semantic_context,
+            store,
+            key_custody,
             metrics,
         }
     }
@@ -302,12 +291,18 @@ impl NexusExecutionPort {
     pub(crate) async fn execute(
         &self,
         authorized: AuthorizedExecution,
+        on_authorization_consumed: impl FnOnce(),
         on_execution_started: impl FnOnce(),
     ) -> Result<ToolOutput, RuntimeError> {
         self.metrics.execution_port_call();
 
-        // Re-resolve at the last trusted boundary to close the registry TOCTOU window.
-        let registered_tool = self.registry.resolve(&authorized.tool_id)?;
+        // This full-chain validation plus single-use consumption is the R2
+        // execution commit point. Control-plane transitions that linearize
+        // before it reject; transitions after it affect later executions.
+        let (registered_tool, live_manifest) = self.registry.resolve_with_capability_manifest(
+            &authorized.tool_id,
+            &authorized.capability_manifest,
+        )?;
         if registered_tool.manifest_digest()? != authorized.tool_manifest_digest {
             return Err(runtime_error(
                 ErrorCode::ToolManifestMismatch,
@@ -315,26 +310,153 @@ impl NexusExecutionPort {
             ));
         }
 
-        let mut tokens = Vec::with_capacity(authorized.required_capabilities.len());
-        for capability in authorized.required_capabilities {
-            let token = self
-                .hypervisor
-                .issue_token(capability, "aeon-r1", TOKEN_VALIDITY)
-                .map_err(|error| runtime_error(ErrorCode::ExecutionFailed, error.to_string()))?;
-            self.metrics.token_issued();
-            tokens.push(token);
-        }
+        let expected_leaf_generation = authorized
+            .observed_generations
+            .iter()
+            .find(|(lease_id, _)| lease_id == &authorized.certificate.authority_lease_id)
+            .map(|(_, generation)| *generation)
+            .ok_or_else(|| {
+                runtime_error(
+                    ErrorCode::AuthorizationInvalid,
+                    "authorization omitted the active lease generation",
+                )
+            })?;
+        let commit_now = Utc::now();
+        let (hypervisor, tokens) = self.authority_kernel.commit_active_chain(
+            &authorized.certificate.authority_lease_id,
+            Some(expected_leaf_generation),
+            &live_manifest,
+            commit_now,
+            |validated| {
+                if validated.observed_generations != authorized.observed_generations
+                    || validated.agent_identity_digest
+                        != authorized.certificate.agent_identity_digest
+                    || validated.semantic_context_digest
+                        != authorized.certificate.semantic_context_digest
+                    || validated.capability_manifest_digest != live_manifest.canonical_digest()?
+                {
+                    return Err(runtime_error(
+                        ErrorCode::AuthorizationInvalid,
+                        "live authority no longer matches the issued action certificate",
+                    ));
+                }
+                let current_context_digest = self
+                    .semantic_context
+                    .read()
+                    .map_err(|_| {
+                        runtime_error(ErrorCode::Internal, "semantic context lock poisoned")
+                    })?
+                    .canonical_digest()?;
+                if current_context_digest != validated.semantic_context_digest {
+                    return Err(runtime_error(
+                        ErrorCode::SemanticContextChanged,
+                        "semantic context changed before Nexus entry",
+                    ));
+                }
+                validate_action_certificate(
+                    &authorized.certificate,
+                    &authorized,
+                    self.key_custody.as_ref(),
+                    commit_now,
+                )?;
+
+                // Token issuance remains synchronous and inside the authority
+                // read guard. Control-plane transitions therefore linearize
+                // either before validation or after token minting and
+                // single-use authorization consumption.
+                let issue_now = Utc::now();
+                let remaining_authority =
+                    std::cmp::min(validated.leaf_expires_at, authorized.certificate.expires_at)
+                        - issue_now;
+                let token_validity = remaining_authority.to_std().map_err(|_| {
+                    runtime_error(
+                        ErrorCode::LeaseInactive,
+                        "authority expired before Nexus token issuance",
+                    )
+                })?;
+                let token_validity = std::cmp::min(TOKEN_VALIDITY, token_validity);
+                if token_validity.is_zero() {
+                    return Err(runtime_error(
+                        ErrorCode::LeaseInactive,
+                        "authority expired before Nexus token issuance",
+                    ));
+                }
+
+                // Pinned Nexus has no public token-revocation API. A per-call
+                // hypervisor confines its capability manager and bearer tokens
+                // to this execution. Any error in this closure drops both.
+                let hypervisor =
+                    NexusHypervisor::new(self.hypervisor_config.clone()).map_err(|_| {
+                        runtime_error(ErrorCode::ExecutionFailed, "Nexus initialization failed")
+                    })?;
+                let mut tokens = Vec::with_capacity(authorized.required_capabilities.len());
+                for capability in authorized.required_capabilities.iter().cloned() {
+                    let token = hypervisor
+                        .issue_token(capability, "aeon-r2", token_validity)
+                        .map_err(|_| {
+                            runtime_error(ErrorCode::ExecutionFailed, "Nexus token issuance failed")
+                        })?;
+                    self.metrics.token_issued();
+                    tokens.push(token);
+                }
+
+                self.store.consume_authorization(
+                    &authorized.certificate.authorization_record_id,
+                    authorized.certificate.authorization_generation,
+                )?;
+                on_authorization_consumed();
+                Ok((hypervisor, tokens))
+            },
+        )?;
 
         let tool_definition = registered_tool.tool_definition();
         on_execution_started();
         self.metrics.nexus_execution();
-        self.hypervisor
+        hypervisor
             .execute_tool_with_tokens(tool_definition, authorized.arguments, &tokens)
             .await
-            .map_err(|error| runtime_error(ErrorCode::ExecutionFailed, error.to_string()))
+            .map_err(|_| runtime_error(ErrorCode::ExecutionFailed, "Nexus execution failed"))
     }
+}
+
+fn validate_action_certificate(
+    certificate: &ActionCertificate,
+    authorized: &AuthorizedExecution,
+    key_custody: &dyn KeyCustody,
+    now: DateTime<Utc>,
+) -> Result<(), RuntimeError> {
+    if now >= certificate.expires_at
+        || certificate.tool_id != authorized.tool_id
+        || certificate.tool_manifest_digest != authorized.tool_manifest_digest
+        || certificate.concrete_input_digest
+            != canonical_digest("aeon-concrete-input-v1", &authorized.arguments)?
+    {
+        return Err(runtime_error(
+            ErrorCode::AuthorizationInvalid,
+            "action certificate is expired or does not bind the execution request",
+        ));
+    }
+    let signature_bytes = <[u8; 64]>::try_from(certificate.signature.as_bytes()).map_err(|_| {
+        runtime_error(
+            ErrorCode::AuthorizationInvalid,
+            "action certificate signature must contain exactly 64 bytes",
+        )
+    })?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    key_custody
+        .verifying_key()
+        .verify(&certificate.signing_payload()?, &signature)
+        .map_err(|_| {
+            runtime_error(
+                ErrorCode::AuthorizationInvalid,
+                "action certificate signature verification failed",
+            )
+        })
 }
 
 pub(crate) fn runtime_error(code: ErrorCode, message: impl Into<String>) -> RuntimeError {
     RuntimeError::new(code, message)
 }
+
+#[cfg(test)]
+mod tests;
