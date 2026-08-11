@@ -1,0 +1,22 @@
+[workspace]
+members = ["crates/aeon_agent_runtime"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+async-trait = "=0.1.89"
+chrono = { version = "=0.4.45", features = ["serde"] }
+ed25519-dalek = { version = "=2.2.0", features = ["rand_core"] }
+nexus = { git = "https://github.com/adaptiveliquidity/Nexus.git", rev = "c4343883cc4bd1f1262f2f878ed81f8015cedd0e", default-features = false }
+rand = "=0.8.6"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+sha2 = "=0.10.9"
+thiserror = "=2.0.18"
+tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread", "sync"] }
+uuid = { version = "=1.23.3", features = ["serde", "v4"] }
+wat = "=1.251.0"
