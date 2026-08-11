@@ -325,6 +325,66 @@ fn tool_free_runtime_renews_with_a_refreshed_empty_manifest() {
 }
 
 #[test]
+fn registry_drift_cannot_issue_a_mixed_generation_renewal() {
+    let runtime = runtime();
+    let original = runtime.active_lease_snapshot().unwrap();
+    let original_context = runtime.semantic_context().unwrap();
+    assert_eq!(
+        original.certificate.semantic_context_digest,
+        original_context.canonical_digest().unwrap()
+    );
+    assert_eq!(
+        original.manifest.tool_registry_root_digest,
+        original_context.tool_registry_root_digest
+    );
+    let authority_events_before = runtime.authority_events().unwrap();
+
+    let replacement = RegisteredTool::new(
+        ToolId::new("fixture.ledger").unwrap(),
+        wat::parse_str(
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "_start") nop))"#,
+        )
+        .unwrap(),
+        "_start",
+        json!({"type": "object", "additionalProperties": false}),
+        vec![Capability::MemoryPreview],
+        EffectClass::ReadOnly,
+        None,
+    )
+    .unwrap();
+    runtime.registry.replace(replacement).unwrap();
+
+    let drifted_registry_root = runtime.registry.root_digest().unwrap();
+    assert_ne!(
+        drifted_registry_root,
+        original.manifest.tool_registry_root_digest
+    );
+
+    let error = runtime
+        .renew(Utc::now() + Duration::minutes(4))
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::CapabilityManifestMismatch);
+
+    let still_active = runtime.active_lease_snapshot().unwrap();
+    assert_eq!(still_active, original);
+    assert_eq!(runtime.authority_events().unwrap(), authority_events_before);
+    assert_eq!(
+        still_active.certificate.semantic_context_digest,
+        original_context.canonical_digest().unwrap()
+    );
+    assert_eq!(
+        still_active.manifest.tool_registry_root_digest,
+        original_context.tool_registry_root_digest
+    );
+    assert_ne!(
+        still_active.manifest.tool_registry_root_digest,
+        drifted_registry_root
+    );
+}
+
+#[test]
 fn authorization_certificate_snapshot_reports_poison_as_internal() {
     let runtime = runtime();
     let panic = catch_unwind(AssertUnwindSafe(|| {
@@ -406,6 +466,36 @@ async fn consumed_authorization_without_consumption_evidence_is_incomplete() {
     }));
     let completeness_error = runtime.verify_event_completeness().unwrap_err();
     assert_eq!(completeness_error.code(), ErrorCode::EventIncomplete);
+}
+
+#[tokio::test]
+async fn execution_start_evidence_failure_is_a_complete_pre_nexus_rejection() {
+    let runtime = runtime_with_model(Arc::new(TestModel::new([json!({
+        "kind": "tool_call",
+        "tool_id": "fixture.ledger",
+        "arguments": {}
+    })
+    .to_string()])));
+    runtime.store.fail_execution_started_append_for_test();
+
+    let error = runtime.run_once().await.unwrap_err();
+
+    assert_eq!(error.code(), ErrorCode::Internal);
+    assert_eq!(runtime.metrics().token_issues, 1);
+    assert_eq!(runtime.metrics().nexus_executions, 0);
+    assert_eq!(
+        runtime.authorization_records().unwrap()[0].state,
+        crate::AuthorizationState::Consumed
+    );
+    let events = runtime.event_kinds().unwrap();
+    assert!(!events
+        .iter()
+        .any(|kind| matches!(kind, MissionEventKind::ExecutionStarted)));
+    assert!(events.ends_with(&[
+        MissionEventKind::AuthorizationConsumed,
+        MissionEventKind::ExecutionRejectedBeforeNexus(ErrorCode::Internal),
+    ]));
+    runtime.verify_event_completeness().unwrap();
 }
 
 #[tokio::test]

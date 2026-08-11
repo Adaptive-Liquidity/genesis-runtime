@@ -181,6 +181,19 @@ fn agent_spec_enforces_bounded_untrusted_collections_and_step_budget() {
         aeon_agent_runtime::ErrorCode::InvalidInput
     );
 
+    let mut spec = sample_spec();
+    spec.requested_authority.capabilities = vec![Capability::All];
+    assert_eq!(
+        spec.validate().unwrap_err().code(),
+        aeon_agent_runtime::ErrorCode::CapabilityAllForbidden
+    );
+    let error = serde_json::from_value::<AgentSpec>(serde_json::to_value(spec).unwrap())
+        .expect_err("Capability::All must be rejected during AgentSpec deserialization");
+    assert!(
+        error.to_string().contains("Capability::All forbidden"),
+        "unexpected deserialization error: {error}"
+    );
+
     for valid_steps in [1, MAX_AGENT_STEPS] {
         let mut spec = sample_spec();
         spec.resource_budget.max_steps = valid_steps;
@@ -552,8 +565,12 @@ fn protocol_is_closed_and_size_bounded() {
         "not-json",
         r#"{"kind":"unknown"}"#,
         r#"{"kind":"tool_call","tool_id":"fixture.echo"}"#,
+        r#"{"kind":"tool_call","tool_id":7,"arguments":{}}"#,
         r#"{"kind":"tool_call","tool_id":"fixture.echo","arguments":"not-an-object"}"#,
+        r#"{"kind":"tool_call","tool_id":"fixture.echo","arguments":[]}"#,
         r#"{"kind":"tool_call","tool_id":"fixture.echo","arguments":{},"wasm":"attack"}"#,
+        r#"{"kind":"tool_call","kind":"final","tool_id":"fixture.echo","arguments":{}}"#,
+        r#"{"kind":"final","result":7}"#,
         r#"{"kind":"final","result":"done","token":"attack"}"#,
     ] {
         assert!(
@@ -568,11 +585,53 @@ fn protocol_is_closed_and_size_bounded() {
 
 #[test]
 fn protocol_schema_digest_is_stable_and_bound_to_the_closed_message_shape() {
-    const EXPECTED_SCHEMA: &str = r#"{"kind":"tool_call","tool_id":"ToolId","arguments":"object"}|{"kind":"final","result":"string"}"#;
+    let expected_schema = json!({
+        "tag": "kind",
+        "variants": [
+            {
+                "name": "tool_call",
+                "fields": [
+                    {"name": "tool_id", "shape": "tool_id"},
+                    {"name": "arguments", "shape": "object"}
+                ]
+            },
+            {
+                "name": "final",
+                "fields": [
+                    {"name": "result", "shape": "string"}
+                ]
+            }
+        ]
+    });
     assert_eq!(
         AgentMessage::schema_digest().unwrap(),
-        canonical_digest("aeon-agent-protocol-schema-v1", &EXPECTED_SCHEMA).unwrap()
+        canonical_digest("aeon-agent-protocol-schema-v1", &expected_schema).unwrap()
     );
+
+    let messages = [
+        AgentMessage::ToolCall(aeon_agent_runtime::ToolCallProposal {
+            tool_id: tool_id("fixture.echo"),
+            arguments: json!({"value": "hello"}),
+        }),
+        AgentMessage::Final(aeon_agent_runtime::FinalResult {
+            result: "done".into(),
+        }),
+    ];
+    let expected_wire = [
+        json!({
+            "kind": "tool_call",
+            "tool_id": "fixture.echo",
+            "arguments": {"value": "hello"}
+        }),
+        json!({"kind": "final", "result": "done"}),
+    ];
+    for (message, expected) in messages.iter().zip(expected_wire) {
+        let encoded = serde_json::to_value(message).expect("protocol message serialization");
+        assert_eq!(encoded, expected);
+        let decoded: AgentMessage =
+            serde_json::from_value(encoded).expect("protocol message deserialization");
+        assert_eq!(&decoded, message);
+    }
 }
 
 #[test]

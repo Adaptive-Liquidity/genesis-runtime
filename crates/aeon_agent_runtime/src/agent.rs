@@ -98,6 +98,17 @@ impl AgentSpec {
                 format!("requested capabilities must not exceed {MAX_REQUESTED_CAPABILITIES}"),
             ));
         }
+        if self
+            .requested_authority
+            .capabilities
+            .iter()
+            .any(|capability| capability == &nexus::Capability::All)
+        {
+            return Err(RuntimeError::new(
+                ErrorCode::CapabilityAllForbidden,
+                "Capability::All is forbidden for synthesized agents",
+            ));
+        }
         for (index, capability) in self.requested_authority.capabilities.iter().enumerate() {
             if self.requested_authority.capabilities[..index].contains(capability) {
                 return Err(RuntimeError::new(

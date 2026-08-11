@@ -115,6 +115,10 @@ impl CommitFixture {
     }
 
     fn authorize(&self) -> AuthorizedExecution {
+        self.authorize_for_attempt(None)
+    }
+
+    fn authorize_for_attempt(&self, attempt_id: impl Into<Option<u64>>) -> AuthorizedExecution {
         let lease_id = self.authority_kernel.root_lease_id().unwrap();
         let context = self.semantic_context.read().unwrap().clone();
         let (authorized, artifact) = ActionGate
@@ -131,8 +135,33 @@ impl CommitFixture {
                 Utc::now(),
             )
             .unwrap();
-        self.store.insert_authorization(artifact.record).unwrap();
+        if let Some(attempt_id) = attempt_id.into() {
+            self.store
+                .insert_authorization_for_attempt(attempt_id, artifact.record)
+                .unwrap();
+        } else {
+            self.store.insert_authorization(artifact.record).unwrap();
+        }
         authorized
+    }
+
+    fn seed_trusted_history(&self, attempt_id: u64) {
+        for event in [
+            MissionEventKind::MissionCreated,
+            MissionEventKind::ContextResolved,
+            MissionEventKind::LeaseIssued,
+            MissionEventKind::AgentActivated,
+        ] {
+            self.store.append(event).unwrap();
+        }
+        for event in [
+            MissionEventKind::ProtocolAccepted,
+            MissionEventKind::PlanAccepted,
+            MissionEventKind::ActionAuthorized,
+            MissionEventKind::AuthorizationIssued,
+        ] {
+            self.store.append_for_attempt(attempt_id, event).unwrap();
+        }
     }
 
     fn assert_no_nexus(&self) {
@@ -419,12 +448,14 @@ async fn h_commit_first_revoke_blocks_then_future_execution_rejects() {
 #[tokio::test]
 async fn i_authorization_consumed_evidence_failure_is_fail_closed_and_not_reissuable() {
     let fixture = CommitFixture::new();
-    let authorized = fixture.authorize();
-    fixture.store.fail_next_event_append_for_test();
+    let attempt_id = 1;
+    fixture.seed_trusted_history(attempt_id);
+    let authorized = fixture.authorize_for_attempt(attempt_id);
+    fixture.store.fail_authorization_consumed_append_for_test();
 
     let error = fixture
         .port
-        .execute(authorized.clone(), 1)
+        .execute(authorized.clone(), attempt_id)
         .await
         .unwrap_err();
 
@@ -441,6 +472,21 @@ async fn i_authorization_consumed_evidence_failure_is_fail_closed_and_not_reissu
     let records = fixture.store.authorization_records().unwrap();
     assert_eq!(records[0].state, AuthorizationState::Consumed);
     assert_eq!(records[0].remaining_budget.actions, 0);
+    fixture
+        .store
+        .append_for_attempt(
+            attempt_id,
+            MissionEventKind::ExecutionRejectedBeforeNexus(error.code()),
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .verify_event_completeness()
+            .unwrap_err()
+            .code(),
+        ErrorCode::EventIncomplete
+    );
 
     let retry = fixture.port.execute(authorized, 2).await.unwrap_err();
     assert_eq!(retry.code(), ErrorCode::AuthorizationInvalid);
@@ -450,7 +496,60 @@ async fn i_authorization_consumed_evidence_failure_is_fail_closed_and_not_reissu
 }
 
 #[tokio::test]
-async fn j_panicking_test_hook_is_caught_after_single_use_consumption() {
+async fn j_execution_started_evidence_failure_is_complete_pre_nexus_rejection() {
+    let fixture = CommitFixture::new();
+    let attempt_id = 1;
+    fixture.seed_trusted_history(attempt_id);
+    let authorized = fixture.authorize_for_attempt(attempt_id);
+    fixture.store.fail_execution_started_append_for_test();
+
+    let error = fixture
+        .port
+        .execute(authorized.clone(), attempt_id)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Internal);
+    assert_eq!(error.position(), ExecutionPosition::BeforeNexus);
+    fixture
+        .store
+        .append_for_attempt(
+            attempt_id,
+            MissionEventKind::ExecutionRejectedBeforeNexus(error.code()),
+        )
+        .unwrap();
+
+    let records = fixture.store.authorization_records().unwrap();
+    assert_eq!(records[0].state, AuthorizationState::Consumed);
+    assert_eq!(records[0].remaining_budget.actions, 0);
+    assert_eq!(fixture.metrics.snapshot().token_issues, 1);
+    assert_eq!(fixture.metrics.snapshot().nexus_executions, 0);
+    assert_eq!(
+        fixture.store.event_kinds().unwrap(),
+        vec![
+            MissionEventKind::MissionCreated,
+            MissionEventKind::ContextResolved,
+            MissionEventKind::LeaseIssued,
+            MissionEventKind::AgentActivated,
+            MissionEventKind::ProtocolAccepted,
+            MissionEventKind::PlanAccepted,
+            MissionEventKind::ActionAuthorized,
+            MissionEventKind::AuthorizationIssued,
+            MissionEventKind::AuthorizationConsumed,
+            MissionEventKind::ExecutionRejectedBeforeNexus(ErrorCode::Internal),
+        ]
+    );
+    fixture.store.verify_event_completeness().unwrap();
+
+    let retry = fixture.port.execute(authorized, 2).await.unwrap_err();
+    assert_eq!(retry.code(), ErrorCode::AuthorizationInvalid);
+    assert_eq!(retry.position(), ExecutionPosition::BeforeNexus);
+    assert_eq!(fixture.metrics.snapshot().token_issues, 1);
+    assert_eq!(fixture.metrics.snapshot().nexus_executions, 0);
+    fixture.store.verify_event_completeness().unwrap();
+}
+
+#[tokio::test]
+async fn k_panicking_test_hook_is_caught_after_single_use_consumption() {
     let fixture = CommitFixture::new();
     let authorized = fixture.authorize();
 

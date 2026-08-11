@@ -52,9 +52,9 @@ pub struct InMemoryMissionStore {
     events: Mutex<Vec<MissionEvent>>,
     next_attempt_id: AtomicU64,
     #[cfg(test)]
-    fail_next_event_append: AtomicBool,
-    #[cfg(test)]
     fail_authorization_consumed_append: AtomicBool,
+    #[cfg(test)]
+    fail_execution_started_append: AtomicBool,
     agent_record: Mutex<Option<AgentRuntimeRecord>>,
     lease: Mutex<Option<(AuthorityLeaseCertificate, LeaseRecord)>>,
     authorization_records: Mutex<Vec<AuthorizationRecord>>,
@@ -68,9 +68,9 @@ impl InMemoryMissionStore {
             events: Mutex::new(Vec::new()),
             next_attempt_id: AtomicU64::new(0),
             #[cfg(test)]
-            fail_next_event_append: AtomicBool::new(false),
-            #[cfg(test)]
             fail_authorization_consumed_append: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_execution_started_append: AtomicBool::new(false),
             agent_record: Mutex::new(None),
             lease: Mutex::new(None),
             authorization_records: Mutex::new(Vec::new()),
@@ -104,13 +104,6 @@ impl InMemoryMissionStore {
         kind: MissionEventKind,
     ) -> Result<(), RuntimeError> {
         #[cfg(test)]
-        if self.fail_next_event_append.swap(false, Ordering::AcqRel) {
-            return Err(RuntimeError::new(
-                ErrorCode::Internal,
-                "injected mission evidence append failure",
-            ));
-        }
-        #[cfg(test)]
         if matches!(kind, MissionEventKind::AuthorizationConsumed)
             && self
                 .fail_authorization_consumed_append
@@ -119,6 +112,17 @@ impl InMemoryMissionStore {
             return Err(RuntimeError::new(
                 ErrorCode::Internal,
                 "injected AuthorizationConsumed evidence append failure",
+            ));
+        }
+        #[cfg(test)]
+        if matches!(kind, MissionEventKind::ExecutionStarted)
+            && self
+                .fail_execution_started_append
+                .swap(false, Ordering::AcqRel)
+        {
+            return Err(RuntimeError::new(
+                ErrorCode::Internal,
+                "injected ExecutionStarted evidence append failure",
             ));
         }
         let mut events = self
@@ -409,12 +413,13 @@ fn validate_available_record(
 
 #[cfg(test)]
 impl InMemoryMissionStore {
-    pub(crate) fn fail_next_event_append_for_test(&self) {
-        self.fail_next_event_append.store(true, Ordering::Release);
-    }
-
     pub(crate) fn fail_authorization_consumed_append_for_test(&self) {
         self.fail_authorization_consumed_append
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn fail_execution_started_append_for_test(&self) {
+        self.fail_execution_started_append
             .store(true, Ordering::Release);
     }
 
@@ -439,6 +444,14 @@ fn validate_attempt(events: &[MissionEventKind]) -> Result<(), RuntimeError> {
                 ActionAuthorized,
                 AuthorizationIssued,
                 ExecutionRejectedBeforeNexus(_) | ExecutionFailed(_),
+            ]
+            | [
+                ProtocolAccepted,
+                PlanAccepted,
+                ActionAuthorized,
+                AuthorizationIssued,
+                AuthorizationConsumed,
+                ExecutionRejectedBeforeNexus(_),
             ]
             | [
                 ProtocolAccepted,
