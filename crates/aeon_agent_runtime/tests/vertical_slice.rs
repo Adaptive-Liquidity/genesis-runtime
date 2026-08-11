@@ -107,7 +107,16 @@ fn runtime(
     spec: AgentSpec,
     tools: Vec<RegisteredTool>,
 ) -> (R1Runtime, Arc<ScriptedModelClient>) {
-    let model = Arc::new(ScriptedModelClient::new([raw.to_owned()]));
+    runtime_with_responses(vec![raw.to_owned()], mission, spec, tools)
+}
+
+fn runtime_with_responses(
+    responses: Vec<String>,
+    mission: MissionEnvelope,
+    spec: AgentSpec,
+    tools: Vec<RegisteredTool>,
+) -> (R1Runtime, Arc<ScriptedModelClient>) {
+    let model = Arc::new(ScriptedModelClient::new(responses));
     let registry = ToolRegistry::from_tools(tools).unwrap();
     let runtime = R1Runtime::bootstrap(
         mission,
@@ -171,6 +180,65 @@ async fn valid_typed_proposal_reaches_real_nexus() {
         ]
     );
     runtime.verify_event_completeness().unwrap();
+}
+
+#[tokio::test]
+async fn multi_run_event_histories_are_complete_per_attempt() {
+    let capability = Capability::MemoryPreview;
+    let success = tool_call(FIXTURE_TOOL_ID);
+    let action_rejected = tool_call("fixture.unknown");
+
+    let cases = [
+        vec![success.clone(), "not-json".to_owned()],
+        vec!["not-json".to_owned(), success.clone()],
+        vec![success.clone(), action_rejected.clone()],
+        vec![action_rejected, success.clone()],
+        vec![success.clone(), success],
+    ];
+
+    for (case_index, responses) in cases.into_iter().enumerate() {
+        let mut case_mission = mission(vec![FIXTURE_TOOL_ID], vec![capability.clone()]);
+        case_mission.max_actions = 2;
+        let mut case_spec = spec(vec![capability.clone()]);
+        case_spec.resource_budget.max_steps = responses.len() as u64;
+        let (runtime, _) = runtime_with_responses(
+            responses,
+            case_mission,
+            case_spec,
+            vec![fixture_tool(
+                FIXTURE_TOOL_ID,
+                case_index as i32 + 1,
+                vec![capability.clone()],
+            )],
+        );
+
+        let first = runtime.run_once().await;
+        let second = runtime.run_once().await;
+        match case_index {
+            0 => {
+                assert!(matches!(first.unwrap(), RunOutcome::Executed(_)));
+                assert_eq!(second.unwrap_err().code(), ErrorCode::MalformedProtocol);
+            }
+            1 => {
+                assert_eq!(first.unwrap_err().code(), ErrorCode::MalformedProtocol);
+                assert!(matches!(second.unwrap(), RunOutcome::Executed(_)));
+            }
+            2 => {
+                assert!(matches!(first.unwrap(), RunOutcome::Executed(_)));
+                assert_eq!(second.unwrap_err().code(), ErrorCode::ToolOutsideMission);
+            }
+            3 => {
+                assert_eq!(first.unwrap_err().code(), ErrorCode::ToolOutsideMission);
+                assert!(matches!(second.unwrap(), RunOutcome::Executed(_)));
+            }
+            4 => {
+                assert!(matches!(first.unwrap(), RunOutcome::Executed(_)));
+                assert!(matches!(second.unwrap(), RunOutcome::Executed(_)));
+            }
+            _ => unreachable!(),
+        }
+        runtime.verify_event_completeness().unwrap();
+    }
 }
 
 #[tokio::test]

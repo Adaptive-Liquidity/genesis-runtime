@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::action::AuthorizationRecord;
@@ -15,6 +17,7 @@ pub enum MissionEventKind {
     ContextResolved,
     LeaseIssued,
     AgentActivated,
+    ModelFailed(ErrorCode),
     ProtocolAccepted,
     ProtocolRejected(ErrorCode),
     PlanAccepted,
@@ -27,6 +30,7 @@ pub enum MissionEventKind {
     ExecutionFailed(ErrorCode),
     ExecutionCompleted,
     FinalProduced,
+    FinalRejected(ErrorCode),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +38,7 @@ pub enum MissionEventKind {
 pub struct MissionEvent {
     pub sequence: u64,
     pub mission_id: MissionId,
+    pub attempt_id: Option<u64>,
     pub kind: MissionEventKind,
     pub occurred_at: DateTime<Utc>,
 }
@@ -42,6 +47,7 @@ pub struct MissionEvent {
 pub struct InMemoryMissionStore {
     mission: MissionEnvelope,
     events: Mutex<Vec<MissionEvent>>,
+    next_attempt_id: AtomicU64,
     authorization_count: Mutex<usize>,
     agent_record: Mutex<Option<AgentRuntimeRecord>>,
     lease: Mutex<Option<(AuthorityLeaseCertificate, LeaseRecord)>>,
@@ -53,6 +59,7 @@ impl InMemoryMissionStore {
         Self {
             mission,
             events: Mutex::new(Vec::new()),
+            next_attempt_id: AtomicU64::new(0),
             authorization_count: Mutex::new(0),
             agent_record: Mutex::new(None),
             lease: Mutex::new(None),
@@ -65,11 +72,24 @@ impl InMemoryMissionStore {
     }
 
     pub fn append(&self, kind: MissionEventKind) {
+        self.append_event(None, kind);
+    }
+
+    pub fn begin_attempt(&self) -> u64 {
+        self.next_attempt_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn append_for_attempt(&self, attempt_id: u64, kind: MissionEventKind) {
+        self.append_event(Some(attempt_id), kind);
+    }
+
+    fn append_event(&self, attempt_id: Option<u64>, kind: MissionEventKind) {
         let mut events = self.events.lock().expect("mission event lock poisoned");
         let sequence = events.len() as u64 + 1;
         events.push(MissionEvent {
             sequence,
             mission_id: self.mission.mission_id.clone(),
+            attempt_id,
             kind,
             occurred_at: Utc::now(),
         });
@@ -184,139 +204,97 @@ impl InMemoryMissionStore {
     }
 
     pub fn verify_event_completeness(&self) -> Result<(), RuntimeError> {
-        let events = self.event_kinds();
+        let events = self.events();
         let foundational = [
             MissionEventKind::MissionCreated,
             MissionEventKind::ContextResolved,
             MissionEventKind::LeaseIssued,
             MissionEventKind::AgentActivated,
         ];
-        if events.len() < foundational.len() || events[..foundational.len()] != foundational {
+        if events.len() < foundational.len()
+            || events[..foundational.len()]
+                .iter()
+                .map(|event| &event.kind)
+                .ne(foundational.iter())
+            || events[..foundational.len()]
+                .iter()
+                .any(|event| event.attempt_id.is_some())
+        {
             return Err(incomplete(
                 "mission history is missing its trusted activation prefix",
             ));
         }
 
-        let raw_events = self.events();
-        if raw_events
+        if events
             .iter()
             .enumerate()
             .any(|(index, event)| event.sequence != index as u64 + 1)
         {
             return Err(incomplete("mission event sequence is not contiguous"));
         }
-
-        for (index, event) in events.iter().enumerate() {
-            if matches!(event, MissionEventKind::ExecutionCompleted)
-                && !has_ordered_prefix(
-                    &events[..index],
-                    &[EventTag::AuthorizationConsumed, EventTag::ExecutionStarted],
-                )
-            {
-                return Err(incomplete(
-                    "execution completed without authorization consumption and start",
-                ));
-            }
-            if matches!(event, MissionEventKind::AuthorizationConsumed)
-                && !events[..index]
-                    .iter()
-                    .any(|kind| matches!(kind, MissionEventKind::AuthorizationIssued))
-            {
-                return Err(incomplete("authorization consumed without being issued"));
-            }
-        }
-
         if events
             .iter()
-            .any(|event| matches!(event, MissionEventKind::ProtocolRejected(_)))
-            && events.iter().any(|event| {
-                matches!(
-                    event,
-                    MissionEventKind::ActionAuthorized
-                        | MissionEventKind::AuthorizationIssued
-                        | MissionEventKind::AuthorizationConsumed
-                        | MissionEventKind::ExecutionStarted
-                        | MissionEventKind::ExecutionCompleted
-                )
-            })
+            .any(|event| event.mission_id != self.mission.mission_id)
         {
-            return Err(incomplete(
-                "protocol rejection was followed by an execution transition",
-            ));
+            return Err(incomplete("mission event is bound to the wrong mission"));
         }
 
-        for (index, event) in events.iter().enumerate() {
-            if matches!(event, MissionEventKind::ActionRejected(_))
-                && events[index + 1..].iter().any(is_execution_transition)
-            {
+        let mut attempts: BTreeMap<u64, Vec<MissionEventKind>> = BTreeMap::new();
+        for event in &events[foundational.len()..] {
+            let attempt_id = event.attempt_id.ok_or_else(|| {
+                incomplete("runtime event is missing its originating attempt identifier")
+            })?;
+            if attempt_id == 0 {
                 return Err(incomplete(
-                    "action rejection was followed by an authorization or execution transition",
+                    "runtime event has an invalid attempt identifier",
                 ));
             }
-            if matches!(event, MissionEventKind::ExecutionRejectedBeforeNexus(_))
-                && events[index + 1..].iter().any(|kind| {
-                    matches!(
-                        kind,
-                        MissionEventKind::ExecutionStarted | MissionEventKind::ExecutionCompleted
-                    )
-                })
-            {
-                return Err(incomplete(
-                    "pre-Nexus execution rejection was followed by execution",
-                ));
-            }
+            attempts
+                .entry(attempt_id)
+                .or_default()
+                .push(event.kind.clone());
         }
-
-        for (index, event) in events.iter().enumerate() {
-            if matches!(event, MissionEventKind::ExecutionStarted)
-                && !events[index + 1..].iter().any(|kind| {
-                    matches!(
-                        kind,
-                        MissionEventKind::ExecutionCompleted | MissionEventKind::ExecutionFailed(_)
-                    )
-                })
-            {
-                return Err(incomplete("execution start has no terminal outcome event"));
-            }
+        for attempt in attempts.values() {
+            validate_attempt(attempt)?;
         }
 
         Ok(())
     }
 }
 
-fn is_execution_transition(event: &MissionEventKind) -> bool {
-    matches!(
-        event,
-        MissionEventKind::ActionAuthorized
-            | MissionEventKind::AuthorizationIssued
-            | MissionEventKind::AuthorizationConsumed
-            | MissionEventKind::ExecutionStarted
-            | MissionEventKind::ExecutionFailed(_)
-            | MissionEventKind::ExecutionCompleted
-    )
-}
+fn validate_attempt(events: &[MissionEventKind]) -> Result<(), RuntimeError> {
+    use MissionEventKind::*;
 
-#[derive(Clone, Copy)]
-enum EventTag {
-    AuthorizationConsumed,
-    ExecutionStarted,
-}
-
-fn has_ordered_prefix(events: &[MissionEventKind], required: &[EventTag]) -> bool {
-    let mut next = 0;
-    for event in events {
-        let matches = match required.get(next) {
-            Some(EventTag::AuthorizationConsumed) => {
-                matches!(event, MissionEventKind::AuthorizationConsumed)
-            }
-            Some(EventTag::ExecutionStarted) => matches!(event, MissionEventKind::ExecutionStarted),
-            None => return true,
-        };
-        if matches {
-            next += 1;
-        }
+    let complete = matches!(
+        events,
+        [ModelFailed(_)]
+            | [ProtocolRejected(_)]
+            | [ProtocolAccepted, FinalProduced | FinalRejected(_)]
+            | [ProtocolAccepted, PlanAccepted, ActionRejected(_)]
+            | [
+                ProtocolAccepted,
+                PlanAccepted,
+                ActionAuthorized,
+                AuthorizationIssued,
+                ExecutionRejectedBeforeNexus(_) | ExecutionFailed(_),
+            ]
+            | [
+                ProtocolAccepted,
+                PlanAccepted,
+                ActionAuthorized,
+                AuthorizationIssued,
+                AuthorizationConsumed,
+                ExecutionStarted,
+                ExecutionCompleted | ExecutionFailed(_),
+            ]
+    );
+    if complete {
+        Ok(())
+    } else {
+        Err(incomplete(
+            "attempt history is incomplete, out of order, or crosses a terminal event",
+        ))
     }
-    next == required.len()
 }
 
 fn incomplete(message: impl Into<String>) -> RuntimeError {

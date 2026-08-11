@@ -371,6 +371,87 @@ fn append_foundation(store: &InMemoryMissionStore) {
     }
 }
 
+fn append_attempt(
+    store: &InMemoryMissionStore,
+    attempt_id: u64,
+    events: impl IntoIterator<Item = MissionEventKind>,
+) {
+    for event in events {
+        store.append_for_attempt(attempt_id, event);
+    }
+}
+
+fn successful_attempt() -> Vec<MissionEventKind> {
+    vec![
+        MissionEventKind::ProtocolAccepted,
+        MissionEventKind::PlanAccepted,
+        MissionEventKind::ActionAuthorized,
+        MissionEventKind::AuthorizationIssued,
+        MissionEventKind::AuthorizationConsumed,
+        MissionEventKind::ExecutionStarted,
+        MissionEventKind::ExecutionCompleted,
+    ]
+}
+
+fn protocol_rejected_attempt() -> Vec<MissionEventKind> {
+    vec![MissionEventKind::ProtocolRejected(
+        ErrorCode::MalformedProtocol,
+    )]
+}
+
+fn action_rejected_attempt() -> Vec<MissionEventKind> {
+    vec![
+        MissionEventKind::ProtocolAccepted,
+        MissionEventKind::PlanAccepted,
+        MissionEventKind::ActionRejected(ErrorCode::UnknownTool),
+    ]
+}
+
+fn pre_nexus_rejected_attempt() -> Vec<MissionEventKind> {
+    vec![
+        MissionEventKind::ProtocolAccepted,
+        MissionEventKind::PlanAccepted,
+        MissionEventKind::ActionAuthorized,
+        MissionEventKind::AuthorizationIssued,
+        MissionEventKind::ExecutionRejectedBeforeNexus(ErrorCode::ToolManifestMismatch),
+    ]
+}
+
+#[test]
+fn mission_store_accepts_complete_histories_across_attempt_boundaries() {
+    let histories = [
+        (successful_attempt(), protocol_rejected_attempt()),
+        (protocol_rejected_attempt(), successful_attempt()),
+        (successful_attempt(), action_rejected_attempt()),
+        (action_rejected_attempt(), successful_attempt()),
+        (pre_nexus_rejected_attempt(), successful_attempt()),
+        (successful_attempt(), successful_attempt()),
+    ];
+
+    for (first, second) in histories {
+        let store = InMemoryMissionStore::new(sample_mission());
+        append_foundation(&store);
+        let first_attempt = store.begin_attempt();
+        append_attempt(&store, first_attempt, first);
+        let second_attempt = store.begin_attempt();
+        append_attempt(&store, second_attempt, second);
+
+        store.verify_event_completeness().unwrap();
+    }
+
+    let interleaved = InMemoryMissionStore::new(sample_mission());
+    append_foundation(&interleaved);
+    let final_attempt = interleaved.begin_attempt();
+    let rejected_attempt = interleaved.begin_attempt();
+    interleaved.append_for_attempt(final_attempt, MissionEventKind::ProtocolAccepted);
+    interleaved.append_for_attempt(
+        rejected_attempt,
+        MissionEventKind::ProtocolRejected(ErrorCode::MalformedProtocol),
+    );
+    interleaved.append_for_attempt(final_attempt, MissionEventKind::FinalProduced);
+    interleaved.verify_event_completeness().unwrap();
+}
+
 #[test]
 fn mission_store_detects_incomplete_rejection_and_execution_histories() {
     let empty = InMemoryMissionStore::new(sample_mission());
@@ -379,35 +460,117 @@ fn mission_store_detects_incomplete_rejection_and_execution_histories() {
 
     let protocol_rejected = InMemoryMissionStore::new(sample_mission());
     append_foundation(&protocol_rejected);
-    protocol_rejected.append(MissionEventKind::ProtocolRejected(
-        ErrorCode::MalformedProtocol,
-    ));
-    protocol_rejected.append(MissionEventKind::ExecutionStarted);
+    let attempt = protocol_rejected.begin_attempt();
+    append_attempt(
+        &protocol_rejected,
+        attempt,
+        [
+            MissionEventKind::ProtocolRejected(ErrorCode::MalformedProtocol),
+            MissionEventKind::ExecutionStarted,
+        ],
+    );
     assert!(protocol_rejected.verify_event_completeness().is_err());
 
     let action_rejected = InMemoryMissionStore::new(sample_mission());
     append_foundation(&action_rejected);
-    action_rejected.append(MissionEventKind::ActionRejected(ErrorCode::UnknownTool));
-    action_rejected.append(MissionEventKind::AuthorizationIssued);
+    let attempt = action_rejected.begin_attempt();
+    append_attempt(
+        &action_rejected,
+        attempt,
+        [
+            MissionEventKind::ProtocolAccepted,
+            MissionEventKind::PlanAccepted,
+            MissionEventKind::ActionRejected(ErrorCode::UnknownTool),
+            MissionEventKind::AuthorizationIssued,
+        ],
+    );
     assert!(action_rejected.verify_event_completeness().is_err());
 
     let consumed_without_issue = InMemoryMissionStore::new(sample_mission());
     append_foundation(&consumed_without_issue);
-    consumed_without_issue.append(MissionEventKind::AuthorizationConsumed);
+    let attempt = consumed_without_issue.begin_attempt();
+    append_attempt(
+        &consumed_without_issue,
+        attempt,
+        [
+            MissionEventKind::ProtocolAccepted,
+            MissionEventKind::PlanAccepted,
+            MissionEventKind::ActionAuthorized,
+            MissionEventKind::AuthorizationConsumed,
+        ],
+    );
     assert!(consumed_without_issue.verify_event_completeness().is_err());
 
     let completed_without_start = InMemoryMissionStore::new(sample_mission());
     append_foundation(&completed_without_start);
-    completed_without_start.append(MissionEventKind::ExecutionCompleted);
+    let attempt = completed_without_start.begin_attempt();
+    append_attempt(
+        &completed_without_start,
+        attempt,
+        [
+            MissionEventKind::ProtocolAccepted,
+            MissionEventKind::PlanAccepted,
+            MissionEventKind::ActionAuthorized,
+            MissionEventKind::AuthorizationIssued,
+            MissionEventKind::AuthorizationConsumed,
+            MissionEventKind::ExecutionCompleted,
+        ],
+    );
     assert!(completed_without_start.verify_event_completeness().is_err());
 
     let before_nexus = InMemoryMissionStore::new(sample_mission());
     append_foundation(&before_nexus);
-    before_nexus.append(MissionEventKind::ExecutionRejectedBeforeNexus(
-        ErrorCode::ToolManifestMismatch,
-    ));
-    before_nexus.append(MissionEventKind::ExecutionCompleted);
+    let attempt = before_nexus.begin_attempt();
+    append_attempt(
+        &before_nexus,
+        attempt,
+        [
+            MissionEventKind::ProtocolAccepted,
+            MissionEventKind::PlanAccepted,
+            MissionEventKind::ActionAuthorized,
+            MissionEventKind::AuthorizationIssued,
+            MissionEventKind::ExecutionRejectedBeforeNexus(ErrorCode::ToolManifestMismatch),
+            MissionEventKind::ExecutionCompleted,
+        ],
+    );
     assert!(before_nexus.verify_event_completeness().is_err());
+
+    let started_without_terminal = InMemoryMissionStore::new(sample_mission());
+    append_foundation(&started_without_terminal);
+    let attempt = started_without_terminal.begin_attempt();
+    append_attempt(
+        &started_without_terminal,
+        attempt,
+        [
+            MissionEventKind::ProtocolAccepted,
+            MissionEventKind::PlanAccepted,
+            MissionEventKind::ActionAuthorized,
+            MissionEventKind::AuthorizationIssued,
+            MissionEventKind::AuthorizationConsumed,
+            MissionEventKind::ExecutionStarted,
+        ],
+    );
+    assert!(started_without_terminal
+        .verify_event_completeness()
+        .is_err());
+
+    let order_corrupted = InMemoryMissionStore::new(sample_mission());
+    append_foundation(&order_corrupted);
+    let attempt = order_corrupted.begin_attempt();
+    append_attempt(
+        &order_corrupted,
+        attempt,
+        [
+            MissionEventKind::ProtocolAccepted,
+            MissionEventKind::PlanAccepted,
+            MissionEventKind::ActionAuthorized,
+            MissionEventKind::AuthorizationIssued,
+            MissionEventKind::ExecutionStarted,
+            MissionEventKind::AuthorizationConsumed,
+            MissionEventKind::ExecutionCompleted,
+        ],
+    );
+    assert!(order_corrupted.verify_event_completeness().is_err());
 }
 
 #[test]

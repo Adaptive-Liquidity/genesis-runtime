@@ -7,12 +7,13 @@ use nexus::{Capability, HypervisorConfig, NexusHypervisor, ToolOutput};
 
 use crate::execution::{runtime_error, ActionGate, MetricCounters, NexusExecutionPort};
 use crate::{
-    canonical_digest, resolved_system_instruction, ActionCertificate, AgentId, AgentMessage,
-    AgentSpec, AuthorityEvent, AuthorityKernel, AuthoritySet, AuthorizationRecord, BoundTool,
-    CapabilityManifest, ContextResolver, ErrorCode, FinalResult, InMemoryKeyCustody,
-    InMemoryMissionStore, KeyCustody, KeyId, LeaseId, LeaseRecord, LeaseSnapshot, MissionEnvelope,
-    MissionEventKind, ModelClient, ModelRequest, PermissionSet, ProtocolGate, RegisteredTool,
-    RenewalRequest, RootLeaseRequest, RuntimeError, SemanticContext, ToolRegistry,
+    canonical_digest, resolved_system_instruction, validate_context_continuation,
+    ActionCertificate, AgentId, AgentMessage, AgentSpec, AuthorityEvent, AuthorityKernel,
+    AuthoritySet, AuthorizationRecord, BoundTool, CapabilityManifest, ContextResolver, ErrorCode,
+    FinalResult, InMemoryKeyCustody, InMemoryMissionStore, KeyCustody, KeyId, LeaseId, LeaseRecord,
+    LeaseSnapshot, MissionEnvelope, MissionEventKind, ModelClient, ModelRequest, PermissionSet,
+    ProtocolGate, RegisteredTool, RenewalRequest, RootLeaseRequest, RuntimeError, SemanticContext,
+    ToolRegistry, ValidatedAuthority,
 };
 
 pub use crate::execution::R1Metrics;
@@ -22,6 +23,11 @@ pub type R2Runtime = R1Runtime;
 pub enum RunOutcome {
     Executed(Box<ToolOutput>),
     Final(FinalResult),
+}
+
+struct ModelAuthorityObservation {
+    lease: LeaseSnapshot,
+    validated: ValidatedAuthority,
 }
 
 pub struct R1Runtime {
@@ -224,50 +230,81 @@ impl R1Runtime {
     }
 
     pub async fn run_once(&self) -> Result<RunOutcome, RuntimeError> {
-        self.validate_live_authority(Utc::now())?;
-        reserve_budget(
-            &self.steps_consumed,
-            self.spec.resource_budget.max_steps,
-            "agent step",
-        )?;
-        self.metrics.model_call();
         let semantic_context = self
             .semantic_context
             .read()
             .map_err(|_| runtime_error(ErrorCode::Internal, "semantic context lock poisoned"))?
             .clone();
-        let response = self
+        let model_authority = self.observe_model_authority(&semantic_context, Utc::now())?;
+        reserve_budget(
+            &self.steps_consumed,
+            self.spec.resource_budget.max_steps,
+            "agent step",
+        )?;
+        let resolved_system_instruction = resolved_system_instruction(&self.spec)?;
+        let attempt_id = self.store.begin_attempt();
+        self.metrics.model_call();
+        let response = match self
             .model
             .generate(ModelRequest {
                 agent_id: self.agent_id.clone(),
                 spec: self.spec.clone(),
                 semantic_context: semantic_context.clone(),
-                resolved_system_instruction: resolved_system_instruction(&self.spec)?,
+                resolved_system_instruction,
             })
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.store
+                    .append_for_attempt(attempt_id, MissionEventKind::ModelFailed(error.code()));
+                return Err(error);
+            }
+        };
 
         self.metrics.protocol_gate_call();
         let message = match self.protocol_gate.parse(&response.raw_output) {
             Ok(message) => {
-                self.store.append(MissionEventKind::ProtocolAccepted);
+                self.store
+                    .append_for_attempt(attempt_id, MissionEventKind::ProtocolAccepted);
                 message
             }
             Err(error) => {
-                self.store
-                    .append(MissionEventKind::ProtocolRejected(error.code()));
+                self.store.append_for_attempt(
+                    attempt_id,
+                    MissionEventKind::ProtocolRejected(error.code()),
+                );
                 return Err(error);
             }
         };
 
         match message {
             AgentMessage::Final(final_result) => {
-                self.store.append(MissionEventKind::FinalProduced);
+                if let Err(error) =
+                    self.accept_model_final(&model_authority, attempt_id, Utc::now())
+                {
+                    self.store.append_for_attempt(
+                        attempt_id,
+                        MissionEventKind::FinalRejected(error.code()),
+                    );
+                    return Err(error);
+                }
                 Ok(RunOutcome::Final(final_result))
             }
             AgentMessage::ToolCall(proposal) => {
-                self.store.append(MissionEventKind::PlanAccepted);
+                self.store
+                    .append_for_attempt(attempt_id, MissionEventKind::PlanAccepted);
                 self.metrics.action_gate_call();
-                let active_lease_id = self.authority_kernel.root_lease_id()?;
+                let active_lease_id = match self.authority_kernel.root_lease_id() {
+                    Ok(lease_id) => lease_id,
+                    Err(error) => {
+                        self.store.append_for_attempt(
+                            attempt_id,
+                            MissionEventKind::ActionRejected(error.code()),
+                        );
+                        return Err(error);
+                    }
+                };
                 let authorized = self.action_gate.authorize(
                     &self.mission,
                     &self.agent_id,
@@ -283,8 +320,10 @@ impl R1Runtime {
                 let (authorized_execution, artifact) = match authorized {
                     Ok(value) => value,
                     Err(error) => {
-                        self.store
-                            .append(MissionEventKind::ActionRejected(error.code()));
+                        self.store.append_for_attempt(
+                            attempt_id,
+                            MissionEventKind::ActionRejected(error.code()),
+                        );
                         return Err(error);
                     }
                 };
@@ -294,50 +333,80 @@ impl R1Runtime {
                     self.mission.max_actions,
                     "mission action",
                 ) {
-                    self.store
-                        .append(MissionEventKind::ActionRejected(error.code()));
+                    self.store.append_for_attempt(
+                        attempt_id,
+                        MissionEventKind::ActionRejected(error.code()),
+                    );
                     return Err(error);
                 }
 
-                self.store.append(MissionEventKind::ActionAuthorized);
-                self.store.append(MissionEventKind::AuthorizationIssued);
-                self.store.insert_authorization(artifact.record.clone())?;
-                self.action_certificates
+                self.store
+                    .append_for_attempt(attempt_id, MissionEventKind::ActionAuthorized);
+                self.store
+                    .append_for_attempt(attempt_id, MissionEventKind::AuthorizationIssued);
+                if let Err(error) = self.store.insert_authorization(artifact.record.clone()) {
+                    self.store.append_for_attempt(
+                        attempt_id,
+                        MissionEventKind::ExecutionRejectedBeforeNexus(error.code()),
+                    );
+                    return Err(error);
+                }
+                let certificate_result = self
+                    .action_certificates
                     .lock()
                     .map_err(|_| {
                         runtime_error(ErrorCode::Internal, "certificate ledger lock poisoned")
-                    })?
-                    .push(artifact.certificate);
+                    })
+                    .map(|mut certificates| certificates.push(artifact.certificate));
+                if let Err(error) = certificate_result {
+                    self.store.append_for_attempt(
+                        attempt_id,
+                        MissionEventKind::ExecutionRejectedBeforeNexus(error.code()),
+                    );
+                    return Err(error);
+                }
 
                 let output = match self
                     .execution_port
                     .execute(
                         authorized_execution,
-                        || self.store.append(MissionEventKind::AuthorizationConsumed),
-                        || self.store.append(MissionEventKind::ExecutionStarted),
+                        || {
+                            self.store.append_for_attempt(
+                                attempt_id,
+                                MissionEventKind::AuthorizationConsumed,
+                            )
+                        },
+                        || {
+                            self.store
+                                .append_for_attempt(attempt_id, MissionEventKind::ExecutionStarted)
+                        },
                     )
                     .await
                 {
                     Ok(output) => output,
                     Err(error) => {
                         if error.code() != ErrorCode::ExecutionFailed {
-                            self.store
-                                .append(MissionEventKind::ExecutionRejectedBeforeNexus(
-                                    error.code(),
-                                ));
+                            self.store.append_for_attempt(
+                                attempt_id,
+                                MissionEventKind::ExecutionRejectedBeforeNexus(error.code()),
+                            );
                         } else {
-                            self.store
-                                .append(MissionEventKind::ExecutionFailed(error.code()));
+                            self.store.append_for_attempt(
+                                attempt_id,
+                                MissionEventKind::ExecutionFailed(error.code()),
+                            );
                         }
                         return Err(error);
                     }
                 };
                 if output.success {
-                    self.store.append(MissionEventKind::ExecutionCompleted);
+                    self.store
+                        .append_for_attempt(attempt_id, MissionEventKind::ExecutionCompleted);
                 } else {
-                    self.store.append(MissionEventKind::ExecutionFailed(
-                        ErrorCode::ExecutionFailed,
-                    ));
+                    self.store.append_for_attempt(
+                        attempt_id,
+                        MissionEventKind::ExecutionFailed(ErrorCode::ExecutionFailed),
+                    );
                 }
                 Ok(RunOutcome::Executed(Box::new(output)))
             }
@@ -472,15 +541,91 @@ impl R1Runtime {
         self.registry.replace(tool)
     }
 
-    fn validate_live_authority(&self, now: DateTime<Utc>) -> Result<(), RuntimeError> {
+    fn observe_model_authority(
+        &self,
+        semantic_context: &SemanticContext,
+        now: DateTime<Utc>,
+    ) -> Result<ModelAuthorityObservation, RuntimeError> {
+        if !self.mission.is_usable_at(now) {
+            return Err(runtime_error(
+                ErrorCode::MissionInactive,
+                "mission is inactive or expired",
+            ));
+        }
         let active = self.active_lease_snapshot()?;
-        self.authority_kernel.validate_active_chain(
+        if active.certificate.agent_id != self.agent_id
+            || active.certificate.mission_id != self.mission.mission_id
+            || active.certificate.organization_version != self.mission.organization_version
+            || active.certificate.policy_epoch != self.mission.policy_epoch
+        {
+            return Err(runtime_error(
+                ErrorCode::AuthorizationInvalid,
+                "active authority does not match the runtime binding",
+            ));
+        }
+        let validated = self.authority_kernel.validate_active_chain(
             &active.certificate.lease_id,
             Some(active.record.generation),
             &active.manifest,
             now,
         )?;
-        Ok(())
+        validate_context_continuation(&validated.semantic_context_digest, semantic_context)?;
+        Ok(ModelAuthorityObservation {
+            lease: active,
+            validated,
+        })
+    }
+
+    fn accept_model_final(
+        &self,
+        observation: &ModelAuthorityObservation,
+        attempt_id: u64,
+        now: DateTime<Utc>,
+    ) -> Result<(), RuntimeError> {
+        if !self.mission.is_usable_at(now) {
+            return Err(runtime_error(
+                ErrorCode::MissionInactive,
+                "mission became inactive or expired during model generation",
+            ));
+        }
+        self.authority_kernel.commit_active_chain(
+            &observation.lease.certificate.lease_id,
+            Some(observation.lease.record.generation),
+            &observation.lease.manifest,
+            now,
+            |validated| {
+                if validated.observed_generations != observation.validated.observed_generations {
+                    return Err(runtime_error(
+                        ErrorCode::LeaseGenerationMismatch,
+                        "authority generations changed during model generation",
+                    ));
+                }
+                if validated.chain != observation.validated.chain
+                    || validated.agent_identity_digest
+                        != observation.validated.agent_identity_digest
+                    || validated.capability_manifest_digest
+                        != observation.validated.capability_manifest_digest
+                    || validated.semantic_context_digest
+                        != observation.validated.semantic_context_digest
+                {
+                    return Err(runtime_error(
+                        ErrorCode::AuthorizationInvalid,
+                        "authority binding changed during model generation",
+                    ));
+                }
+                let current_context = self.semantic_context.read().map_err(|_| {
+                    runtime_error(ErrorCode::Internal, "semantic context lock poisoned")
+                })?;
+                validate_context_continuation(
+                    &observation.validated.semantic_context_digest,
+                    &current_context,
+                )?;
+                self.store
+                    .append_for_attempt(attempt_id, MissionEventKind::FinalProduced);
+                drop(current_context);
+                Ok(())
+            },
+        )
     }
 }
 
