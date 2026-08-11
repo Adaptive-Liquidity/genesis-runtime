@@ -146,6 +146,24 @@ pub struct ToolRegistry {
     tools: Arc<RwLock<Vec<RegisteredTool>>>,
 }
 
+/// A coherent view of requested tools and registry identity captured under one read lock.
+#[derive(Debug, Clone)]
+pub(crate) struct RegistrySnapshot {
+    resolved_tools: Vec<RegisteredTool>,
+    bound_tools: Vec<BoundTool>,
+    root_digest: Digest,
+}
+
+impl RegistrySnapshot {
+    pub(crate) fn bound_tools(&self) -> &[BoundTool] {
+        &self.bound_tools
+    }
+
+    pub(crate) fn root_digest(&self) -> Digest {
+        self.root_digest
+    }
+}
+
 impl ToolRegistry {
     pub fn from_tools(tools: Vec<RegisteredTool>) -> Result<Self, RuntimeError> {
         for (index, tool) in tools.iter().enumerate() {
@@ -175,13 +193,11 @@ impl ToolRegistry {
     }
 
     pub fn resolve_all(&self, tool_ids: &[ToolId]) -> Result<Vec<RegisteredTool>, RuntimeError> {
-        tool_ids
-            .iter()
-            .map(|tool_id| self.resolve(tool_id))
-            .collect()
+        Ok(self.snapshot(tool_ids)?.resolved_tools)
     }
 
-    pub fn replace(&self, replacement: RegisteredTool) -> Result<(), RuntimeError> {
+    #[cfg(test)]
+    pub(crate) fn replace(&self, replacement: RegisteredTool) -> Result<(), RuntimeError> {
         let mut tools = self
             .tools
             .write()
@@ -202,6 +218,26 @@ impl ToolRegistry {
         root_digest_for_tools(&tools)
     }
 
+    pub(crate) fn snapshot(&self, tool_ids: &[ToolId]) -> Result<RegistrySnapshot, RuntimeError> {
+        let tools = self
+            .tools
+            .read()
+            .map_err(|_| registry_error(ErrorCode::Internal, "tool registry lock poisoned"))?;
+        snapshot_for_tools(&tools, tool_ids)
+    }
+
+    /// Refreshes every tool binding and the registry root under one read lock.
+    pub(crate) fn refresh_capability_manifest(
+        &self,
+        template: &CapabilityManifest,
+    ) -> Result<CapabilityManifest, RuntimeError> {
+        let tools = self
+            .tools
+            .read()
+            .map_err(|_| registry_error(ErrorCode::Internal, "tool registry lock poisoned"))?;
+        refresh_capability_manifest_for_tools(&tools, template)
+    }
+
     /// Resolves the selected tool and the complete live capability manifest
     /// under one registry read lock, closing cross-tool manifest races.
     pub fn resolve_with_capability_manifest(
@@ -218,30 +254,64 @@ impl ToolRegistry {
             .find(|tool| &tool.manifest.tool_id == tool_id)
             .cloned()
             .ok_or_else(|| registry_error(ErrorCode::UnknownTool, "tool is not registered"))?;
-        let approved_tools = template
-            .approved_tools
-            .iter()
-            .map(|bound| {
-                let registered = tools
-                    .iter()
-                    .find(|tool| tool.manifest.tool_id == bound.tool_id)
-                    .ok_or_else(|| {
-                        registry_error(
-                            ErrorCode::UnknownTool,
-                            "manifest-bound tool is not registered",
-                        )
-                    })?;
-                Ok(BoundTool {
-                    tool_id: bound.tool_id.clone(),
-                    tool_manifest_digest: registered.manifest_digest()?,
-                })
-            })
-            .collect::<Result<Vec<_>, RuntimeError>>()?;
-        let mut manifest = template.clone();
-        manifest.approved_tools = approved_tools;
-        manifest.tool_registry_root_digest = root_digest_for_tools(&tools)?;
+        let manifest = refresh_capability_manifest_for_tools(&tools, template)?;
         Ok((selected, manifest))
     }
+}
+
+fn snapshot_for_tools(
+    tools: &[RegisteredTool],
+    tool_ids: &[ToolId],
+) -> Result<RegistrySnapshot, RuntimeError> {
+    let resolved_tools = tool_ids
+        .iter()
+        .map(|tool_id| {
+            tools
+                .iter()
+                .find(|tool| &tool.manifest.tool_id == tool_id)
+                .cloned()
+                .ok_or_else(|| registry_error(ErrorCode::UnknownTool, "tool is not registered"))
+        })
+        .collect::<Result<Vec<_>, RuntimeError>>()?;
+    let bound_tools = resolved_tools
+        .iter()
+        .map(|tool| {
+            Ok(BoundTool {
+                tool_id: tool.manifest.tool_id.clone(),
+                tool_manifest_digest: tool.manifest_digest()?,
+            })
+        })
+        .collect::<Result<Vec<_>, RuntimeError>>()?;
+    Ok(RegistrySnapshot {
+        resolved_tools,
+        bound_tools,
+        root_digest: root_digest_for_tools(tools)?,
+    })
+}
+
+fn refresh_capability_manifest_for_tools(
+    tools: &[RegisteredTool],
+    template: &CapabilityManifest,
+) -> Result<CapabilityManifest, RuntimeError> {
+    let tool_ids = template
+        .approved_tools
+        .iter()
+        .map(|bound| bound.tool_id.clone())
+        .collect::<Vec<_>>();
+    let snapshot = snapshot_for_tools(tools, &tool_ids).map_err(|error| {
+        if error.code() == ErrorCode::UnknownTool {
+            registry_error(
+                ErrorCode::UnknownTool,
+                "manifest-bound tool is not registered",
+            )
+        } else {
+            error
+        }
+    })?;
+    let mut manifest = template.clone();
+    manifest.approved_tools = snapshot.bound_tools;
+    manifest.tool_registry_root_digest = snapshot.root_digest;
+    Ok(manifest)
 }
 
 fn root_digest_for_tools(tools: &[RegisteredTool]) -> Result<Digest, RuntimeError> {
@@ -286,6 +356,14 @@ fn validate_schema_definition(schema: &Value) -> Result<(), RuntimeError> {
                 "schema type must name a supported primitive type",
             ));
         }
+    }
+    if (schema.contains_key("required") || schema.contains_key("properties"))
+        && schema.get("type").and_then(Value::as_str) != Some("object")
+    {
+        return Err(registry_error(
+            ErrorCode::InvalidInput,
+            "schema required and properties are only supported for type object",
+        ));
     }
     if let Some(required) = schema.get("required") {
         let required = required.as_array().ok_or_else(|| {
@@ -410,4 +488,97 @@ fn hex_sha256(bytes: &[u8]) -> String {
 
 fn registry_error(code: ErrorCode, message: impl Into<String>) -> RuntimeError {
     RuntimeError::new(code, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool(id: &str, wasm: u8) -> RegisteredTool {
+        RegisteredTool::new(
+            ToolId::new(id).expect("valid tool id"),
+            vec![wasm],
+            "_start",
+            json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "additionalProperties": false
+            }),
+            vec![],
+            EffectClass::ReadOnly,
+            None,
+        )
+        .expect("valid tool")
+    }
+
+    #[test]
+    fn registry_snapshot_keeps_tools_bindings_and_root_from_one_generation() {
+        let original = tool("fixture.echo", 1);
+        let replacement = tool("fixture.echo", 2);
+        let registry = ToolRegistry::from_tools(vec![original.clone()]).expect("valid registry");
+
+        let snapshot = registry
+            .snapshot(&[original.manifest().tool_id.clone()])
+            .expect("snapshot resolves");
+        registry.replace(replacement).expect("replacement succeeds");
+
+        assert_eq!(snapshot.resolved_tools[0].manifest(), original.manifest());
+        assert_eq!(
+            snapshot.bound_tools()[0].tool_manifest_digest,
+            original.manifest_digest().expect("digest")
+        );
+        assert_eq!(
+            snapshot.root_digest(),
+            root_digest_for_tools(&[original]).expect("root digest")
+        );
+        assert_ne!(
+            snapshot.root_digest(),
+            registry.root_digest().expect("live root")
+        );
+    }
+
+    #[test]
+    fn capability_manifest_refresh_supports_no_bound_tools() {
+        let registry =
+            ToolRegistry::from_tools(vec![tool("fixture.echo", 1)]).expect("valid registry");
+        let template = CapabilityManifest {
+            version: 1,
+            model_manifest_digest: Digest::new([1; 32]),
+            approved_tools: vec![],
+            permissions: crate::authority::PermissionSet {
+                capabilities: vec![],
+            },
+            runtime_config_digest: Digest::new([2; 32]),
+            tool_registry_root_digest: Digest::new([0; 32]),
+        };
+
+        let refreshed = registry
+            .refresh_capability_manifest(&template)
+            .expect("empty manifest refreshes");
+
+        assert!(refreshed.approved_tools.is_empty());
+        assert_eq!(
+            refreshed.tool_registry_root_digest,
+            registry.root_digest().expect("root digest")
+        );
+    }
+
+    #[test]
+    fn schema_required_and_properties_require_explicit_object_type() {
+        for schema in [
+            json!({"required": ["value"]}),
+            json!({"type": "string", "required": ["value"]}),
+            json!({"properties": {"value": {"type": "string"}}}),
+            json!({"type": "array", "properties": {}}),
+        ] {
+            assert!(validate_schema_definition(&schema).is_err(), "{schema}");
+        }
+
+        assert!(validate_schema_definition(&json!({
+            "type": "object",
+            "required": ["value"],
+            "properties": {"value": {"type": "string"}}
+        }))
+        .is_ok());
+    }
 }

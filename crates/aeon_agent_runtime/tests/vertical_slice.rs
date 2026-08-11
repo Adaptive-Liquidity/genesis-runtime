@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
+mod common;
+
 use aeon_agent_runtime::{
     AgentId, AgentSpec, AuthorityEventKind, AuthorityRequest, Contract, EffectClass, ErrorCode,
     InstructionProfileRef, MemoryRef, MissionEnvelope, MissionEventKind, MissionId, ModelRef,
     Objective, R1Runtime, R2Runtime, RegisteredTool, ResourceRequest, RetrievalIndexRef, Role,
-    RunOutcome, ScriptedModelClient, SemanticRequirements, ToolId, ToolRegistry,
+    RunOutcome, SemanticRequirements, ToolId, ToolRegistry,
 };
 use chrono::{Duration, Utc};
+use common::ScriptedModelClient;
 use nexus::Capability;
 use serde_json::json;
 
@@ -162,9 +165,9 @@ async fn valid_typed_proposal_reaches_real_nexus() {
         ),
         (1, 1, 1, 1, 1, 1)
     );
-    assert_eq!(runtime.authorization_count(), 1);
+    assert_eq!(runtime.authorization_count().unwrap(), 1);
     assert_eq!(
-        runtime.event_kinds(),
+        runtime.event_kinds().unwrap(),
         vec![
             MissionEventKind::MissionCreated,
             MissionEventKind::ContextResolved,
@@ -259,11 +262,13 @@ async fn malformed_output_stops_before_action_gate_and_nexus() {
     );
     assert!(runtime
         .event_kinds()
+        .unwrap()
         .contains(&MissionEventKind::ProtocolRejected(
             ErrorCode::MalformedProtocol
         )));
     assert!(!runtime
         .event_kinds()
+        .unwrap()
         .contains(&MissionEventKind::ExecutionCompleted));
     runtime.verify_event_completeness().unwrap();
 }
@@ -435,7 +440,7 @@ async fn a_second_action_cannot_exceed_the_mission_budget() {
     assert_eq!(error.code(), ErrorCode::BudgetExhausted);
     assert_eq!(runtime.metrics().nexus_executions, 1);
     assert_eq!(runtime.metrics().token_issues, 1);
-    assert_eq!(runtime.authorization_count(), 1);
+    assert_eq!(runtime.authorization_count().unwrap(), 1);
 }
 
 #[tokio::test]
@@ -456,11 +461,13 @@ async fn nexus_tool_failure_emits_a_terminal_execution_failure_event() {
     }
     assert!(runtime
         .event_kinds()
+        .unwrap()
         .contains(&MissionEventKind::ExecutionFailed(
             ErrorCode::ExecutionFailed
         )));
     assert!(!runtime
         .event_kinds()
+        .unwrap()
         .contains(&MissionEventKind::ExecutionCompleted));
     runtime.verify_event_completeness().unwrap();
 }
@@ -477,60 +484,6 @@ async fn registry_tool_requiring_all_is_rejected_at_action_gate() {
     let error = runtime.run_once().await.unwrap_err();
     assert_eq!(error.code(), ErrorCode::CapabilityAllForbidden);
     assert_eq!(runtime.metrics().nexus_executions, 0);
-}
-
-#[tokio::test]
-async fn t8_registry_substitution_is_rejected_before_nexus() {
-    let cap = Capability::MemoryPreview;
-    let raw = tool_call(FIXTURE_TOOL_ID);
-    let (runtime, _) = runtime(
-        &raw,
-        mission(vec![FIXTURE_TOOL_ID], vec![cap.clone()]),
-        spec(vec![cap.clone()]),
-        vec![fixture_tool(FIXTURE_TOOL_ID, 1, vec![cap.clone()])],
-    );
-    runtime
-        .replace_registered_tool(fixture_tool(FIXTURE_TOOL_ID, 2, vec![cap]))
-        .unwrap();
-    let error = runtime.run_once().await.unwrap_err();
-    assert_eq!(error.code(), ErrorCode::ToolManifestMismatch);
-    assert_eq!(runtime.metrics().nexus_executions, 0);
-}
-
-#[tokio::test]
-async fn t11_metadata_version_change_is_exact_but_material_drift_rejects() {
-    let cap = Capability::MemoryPreview;
-    let raw = tool_call(FIXTURE_TOOL_ID);
-    let (metadata_runtime, _) = runtime(
-        &raw,
-        mission(vec![FIXTURE_TOOL_ID], vec![cap.clone()]),
-        spec(vec![cap.clone()]),
-        vec![fixture_tool(FIXTURE_TOOL_ID, 1, vec![cap])],
-    );
-    let mut metadata_only = metadata_runtime.semantic_context();
-    metadata_only.context_version += 1;
-    metadata_runtime
-        .replace_semantic_context(metadata_only)
-        .unwrap();
-    assert!(matches!(
-        metadata_runtime.run_once().await.unwrap(),
-        RunOutcome::Executed(_)
-    ));
-
-    let cap = Capability::MemoryPreview;
-    let raw = tool_call(FIXTURE_TOOL_ID);
-    let (drift_runtime, _) = runtime(
-        &raw,
-        mission(vec![FIXTURE_TOOL_ID], vec![cap.clone()]),
-        spec(vec![cap.clone()]),
-        vec![fixture_tool(FIXTURE_TOOL_ID, 1, vec![cap])],
-    );
-    let mut drifted = drift_runtime.semantic_context();
-    drifted.policy_epoch += 1;
-    drift_runtime.replace_semantic_context(drifted).unwrap();
-    let error = drift_runtime.run_once().await.unwrap_err();
-    assert_eq!(error.code(), ErrorCode::SemanticContextChanged);
-    assert_eq!(drift_runtime.metrics().nexus_executions, 0);
 }
 
 #[tokio::test]
@@ -654,35 +607,6 @@ async fn r2_renewal_switches_immutable_lease_and_new_lease_executes() {
         (1, 1)
     );
     assert!(runtime
-        .authority_events()
-        .unwrap()
-        .iter()
-        .any(|event| event.kind == AuthorityEventKind::LeaseRenewed));
-}
-
-#[tokio::test]
-async fn t11_drift_rejects_execution_then_renewal_without_changing_original_lease() {
-    let cap = Capability::MemoryPreview;
-    let raw = tool_call(FIXTURE_TOOL_ID);
-    let (runtime, _) = runtime(
-        &raw,
-        mission(vec![FIXTURE_TOOL_ID], vec![cap.clone()]),
-        spec(vec![cap.clone()]),
-        vec![fixture_tool(FIXTURE_TOOL_ID, 1, vec![cap])],
-    );
-    let original = runtime.active_lease_snapshot().unwrap();
-    let mut drifted = runtime.semantic_context();
-    drifted.policy_epoch += 1;
-    runtime.replace_semantic_context(drifted).unwrap();
-
-    let execution_error = runtime.run_once().await.unwrap_err();
-    assert_eq!(execution_error.code(), ErrorCode::SemanticContextChanged);
-    let renewal_error = runtime
-        .renew(Utc::now() + Duration::minutes(4))
-        .unwrap_err();
-    assert_eq!(renewal_error.code(), ErrorCode::SemanticContextChanged);
-    assert_eq!(runtime.active_lease_snapshot().unwrap(), original);
-    assert!(!runtime
         .authority_events()
         .unwrap()
         .iter()

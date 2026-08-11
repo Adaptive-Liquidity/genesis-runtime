@@ -2,16 +2,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+#[cfg(test)]
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier};
-use nexus::{Capability, HypervisorConfig, NexusHypervisor, ToolOutput};
+use nexus::{Capability, CapabilityToken, HypervisorConfig, NexusHypervisor, ToolOutput};
 use serde_json::Value;
 
 use crate::{
-    canonical_digest, ActionCertificate, AgentId, AuthorityKernel, AuthoritySet, AuthorizationId,
-    AuthorizationRecord, AuthorizationState, Budget, CanonicalAction, CanonicalJson,
-    CapabilityManifest, CertificateId, Digest, ErrorCode, InMemoryMissionStore, KeyCustody,
-    LeaseId, MissionEnvelope, RuntimeError, SemanticContext, SemanticScope, ToolId, ToolRegistry,
+    canonical_digest, ActionCertificate, ActionTarget, AgentId, AuthorityKernel, AuthoritySet,
+    AuthorizationId, AuthorizationRecord, AuthorizationState, Budget, CanonicalAction,
+    CanonicalJson, CapabilityManifest, CertificateId, Digest, ErrorCode, InMemoryMissionStore,
+    KeyCustody, LeaseId, MissionEnvelope, RuntimeError, SemanticContext, SemanticScope,
+    SignatureBytes, ToolId, ToolRegistry,
 };
 
 const TOKEN_VALIDITY: Duration = Duration::from_secs(30);
@@ -88,6 +92,53 @@ pub(crate) struct AuthorizedExecution {
 pub(crate) struct R1AuthorizationArtifact {
     pub certificate: ActionCertificate,
     pub record: AuthorizationRecord,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecutionPosition {
+    BeforeNexus,
+    Started,
+}
+
+#[derive(Debug)]
+pub(crate) struct PositionedExecutionError {
+    error: RuntimeError,
+    position: ExecutionPosition,
+}
+
+impl PositionedExecutionError {
+    fn before_nexus(error: RuntimeError) -> Self {
+        Self {
+            error,
+            position: ExecutionPosition::BeforeNexus,
+        }
+    }
+
+    fn started(error: RuntimeError) -> Self {
+        Self {
+            error,
+            position: ExecutionPosition::Started,
+        }
+    }
+
+    pub(crate) fn code(&self) -> ErrorCode {
+        self.error.code()
+    }
+
+    pub(crate) fn position(&self) -> ExecutionPosition {
+        self.position
+    }
+
+    pub(crate) fn into_runtime_error(self) -> RuntimeError {
+        self.error
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct ExecutionTestHooks {
+    pub(crate) after_authorization_consumed_under_guard:
+        Option<Arc<dyn Fn() + Send + Sync + 'static>>,
 }
 
 #[derive(Debug, Default)]
@@ -197,7 +248,7 @@ impl ActionGate {
         let canonical_action = CanonicalAction {
             mission_id: mission.mission_id.clone(),
             effect_kind: registered_tool.manifest().effect_class,
-            target: proposal_tool_id.as_str().to_owned(),
+            target: ActionTarget::new(proposal_tool_id.as_str())?,
             normalized_parameters: CanonicalJson::new(arguments.clone()),
             semantic_scope: SemanticScope::Mission,
         };
@@ -205,26 +256,29 @@ impl ActionGate {
         let concrete_input_digest = canonical_digest("aeon-concrete-input-v1", arguments)?;
         let authorization_id = AuthorizationId::new(format!("auth-{}", uuid::Uuid::new_v4()))?;
         let certificate_id = CertificateId::new(format!("cert-{}", uuid::Uuid::new_v4()))?;
-        let mut certificate = ActionCertificate::unsigned_fixture(
-            certificate_id,
-            mission.mission_id.clone(),
-            agent_id.clone(),
-            lease_id.clone(),
-            action_ref,
-            proposal_tool_id.clone(),
-            current_manifest_digest,
-            concrete_input_digest,
-            authorization_id,
-            now,
-        );
-        certificate.agent_identity_digest = validated_authority.agent_identity_digest;
-        certificate.organization_version = mission.organization_version;
-        certificate.policy_epoch = mission.policy_epoch;
-        certificate.semantic_context_digest = current_context_digest;
-        certificate.expires_at = std::cmp::min(
-            certificate.expires_at,
+        let expires_at = std::cmp::min(
+            now + chrono::Duration::minutes(5),
             lease_snapshot.certificate.expires_at,
         );
+        let mut certificate = ActionCertificate {
+            certificate_id,
+            mission_id: mission.mission_id.clone(),
+            agent_identity_digest: validated_authority.agent_identity_digest,
+            authority_lease_id: lease_id.clone(),
+            organization_version: mission.organization_version,
+            policy_epoch: mission.policy_epoch,
+            semantic_context_digest: current_context_digest,
+            action_ref,
+            tool_id: proposal_tool_id.clone(),
+            tool_manifest_digest: current_manifest_digest,
+            concrete_input_digest,
+            authorization_record_id: authorization_id,
+            granted_uses: 1,
+            authorization_generation: 0,
+            issued_at: now,
+            expires_at,
+            signature: SignatureBytes::new(Vec::new()),
+        };
         certificate.signature = key_custody.sign(&certificate.signing_payload()?)?;
 
         let authorization_record = AuthorizationRecord {
@@ -234,7 +288,7 @@ impl ActionGate {
             total_budget: Budget { actions: 1 },
             remaining_budget: Budget { actions: 1 },
             state: AuthorizationState::Issued,
-            stable_idempotency_key: format!("aeon-r1:{:?}", action_ref.digest()),
+            stable_idempotency_key: format!("aeon-r1:{}", action_ref.digest().to_hex()),
             effect_class: canonical_action.effect_kind,
             generation: 0,
         };
@@ -291,23 +345,52 @@ impl NexusExecutionPort {
     pub(crate) async fn execute(
         &self,
         authorized: AuthorizedExecution,
-        on_authorization_consumed: impl FnOnce(),
-        on_execution_started: impl FnOnce(),
-    ) -> Result<ToolOutput, RuntimeError> {
+        attempt_id: u64,
+    ) -> Result<ToolOutput, PositionedExecutionError> {
+        self.execute_inner(
+            authorized,
+            attempt_id,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn execute_with_test_hooks(
+        &self,
+        authorized: AuthorizedExecution,
+        attempt_id: u64,
+        hooks: ExecutionTestHooks,
+    ) -> Result<ToolOutput, PositionedExecutionError> {
+        self.execute_inner(authorized, attempt_id, Some(&hooks))
+            .await
+    }
+
+    async fn execute_inner(
+        &self,
+        authorized: AuthorizedExecution,
+        attempt_id: u64,
+        #[cfg(test)] hooks: Option<&ExecutionTestHooks>,
+    ) -> Result<ToolOutput, PositionedExecutionError> {
         self.metrics.execution_port_call();
 
         // This full-chain validation plus single-use consumption is the R2
         // execution commit point. Control-plane transitions that linearize
         // before it reject; transitions after it affect later executions.
-        let (registered_tool, live_manifest) = self.registry.resolve_with_capability_manifest(
-            &authorized.tool_id,
-            &authorized.capability_manifest,
-        )?;
-        if registered_tool.manifest_digest()? != authorized.tool_manifest_digest {
-            return Err(runtime_error(
+        let (registered_tool, live_manifest) = self
+            .registry
+            .resolve_with_capability_manifest(&authorized.tool_id, &authorized.capability_manifest)
+            .map_err(PositionedExecutionError::before_nexus)?;
+        if registered_tool
+            .manifest_digest()
+            .map_err(PositionedExecutionError::before_nexus)?
+            != authorized.tool_manifest_digest
+        {
+            return Err(PositionedExecutionError::before_nexus(runtime_error(
                 ErrorCode::ToolManifestMismatch,
                 "tool manifest changed before Nexus execution",
-            ));
+            )));
         }
 
         let expected_leaf_generation = authorized
@@ -316,106 +399,138 @@ impl NexusExecutionPort {
             .find(|(lease_id, _)| lease_id == &authorized.certificate.authority_lease_id)
             .map(|(_, generation)| *generation)
             .ok_or_else(|| {
-                runtime_error(
+                PositionedExecutionError::before_nexus(runtime_error(
                     ErrorCode::AuthorizationInvalid,
                     "authorization omitted the active lease generation",
-                )
+                ))
             })?;
         let commit_now = Utc::now();
-        let (hypervisor, tokens) = self.authority_kernel.commit_active_chain(
-            &authorized.certificate.authority_lease_id,
-            Some(expected_leaf_generation),
-            &live_manifest,
-            commit_now,
-            |validated| {
-                if validated.observed_generations != authorized.observed_generations
-                    || validated.agent_identity_digest
-                        != authorized.certificate.agent_identity_digest
-                    || validated.semantic_context_digest
-                        != authorized.certificate.semantic_context_digest
-                    || validated.capability_manifest_digest != live_manifest.canonical_digest()?
-                {
-                    return Err(runtime_error(
-                        ErrorCode::AuthorizationInvalid,
-                        "live authority no longer matches the issued action certificate",
-                    ));
-                }
-                let current_context_digest = self
-                    .semantic_context
-                    .read()
-                    .map_err(|_| {
-                        runtime_error(ErrorCode::Internal, "semantic context lock poisoned")
-                    })?
-                    .canonical_digest()?;
-                if current_context_digest != validated.semantic_context_digest {
-                    return Err(runtime_error(
-                        ErrorCode::SemanticContextChanged,
-                        "semantic context changed before Nexus entry",
-                    ));
-                }
-                validate_action_certificate(
-                    &authorized.certificate,
-                    &authorized,
-                    self.key_custody.as_ref(),
-                    commit_now,
-                )?;
-
-                // Token issuance remains synchronous and inside the authority
-                // read guard. Control-plane transitions therefore linearize
-                // either before validation or after token minting and
-                // single-use authorization consumption.
-                let issue_now = Utc::now();
-                let remaining_authority =
-                    std::cmp::min(validated.leaf_expires_at, authorized.certificate.expires_at)
-                        - issue_now;
-                let token_validity = remaining_authority.to_std().map_err(|_| {
-                    runtime_error(
-                        ErrorCode::LeaseInactive,
-                        "authority expired before Nexus token issuance",
-                    )
-                })?;
-                let token_validity = std::cmp::min(TOKEN_VALIDITY, token_validity);
-                if token_validity.is_zero() {
-                    return Err(runtime_error(
-                        ErrorCode::LeaseInactive,
-                        "authority expired before Nexus token issuance",
-                    ));
-                }
-
-                // Pinned Nexus has no public token-revocation API. A per-call
-                // hypervisor confines its capability manager and bearer tokens
-                // to this execution. Any error in this closure drops both.
-                let hypervisor =
-                    NexusHypervisor::new(self.hypervisor_config.clone()).map_err(|_| {
-                        runtime_error(ErrorCode::ExecutionFailed, "Nexus initialization failed")
-                    })?;
-                let mut tokens = Vec::with_capacity(authorized.required_capabilities.len());
-                for capability in authorized.required_capabilities.iter().cloned() {
-                    let token = hypervisor
-                        .issue_token(capability, "aeon-r2", token_validity)
+        let (hypervisor, tokens) = self
+            .authority_kernel
+            .commit_active_chain(
+                &authorized.certificate.authority_lease_id,
+                Some(expected_leaf_generation),
+                &live_manifest,
+                commit_now,
+                |validated| {
+                    if validated.observed_generations != authorized.observed_generations
+                        || validated.agent_identity_digest
+                            != authorized.certificate.agent_identity_digest
+                        || validated.semantic_context_digest
+                            != authorized.certificate.semantic_context_digest
+                        || validated.capability_manifest_digest
+                            != live_manifest.canonical_digest()?
+                    {
+                        return Err(runtime_error(
+                            ErrorCode::AuthorizationInvalid,
+                            "live authority no longer matches the issued action certificate",
+                        ));
+                    }
+                    let current_context_digest = self
+                        .semantic_context
+                        .read()
                         .map_err(|_| {
-                            runtime_error(ErrorCode::ExecutionFailed, "Nexus token issuance failed")
-                        })?;
-                    self.metrics.token_issued();
-                    tokens.push(token);
-                }
+                            runtime_error(ErrorCode::Internal, "semantic context lock poisoned")
+                        })?
+                        .canonical_digest()?;
+                    if current_context_digest != validated.semantic_context_digest {
+                        return Err(runtime_error(
+                            ErrorCode::SemanticContextChanged,
+                            "semantic context changed before Nexus entry",
+                        ));
+                    }
+                    validate_action_certificate(
+                        &authorized.certificate,
+                        &authorized,
+                        self.key_custody.as_ref(),
+                        commit_now,
+                    )?;
+                    // Token issuance remains synchronous and inside the authority
+                    // read guard. Control-plane transitions therefore linearize
+                    // either before validation or after token minting and
+                    // single-use authorization consumption.
+                    let issue_now = Utc::now();
+                    let remaining_authority =
+                        std::cmp::min(validated.leaf_expires_at, authorized.certificate.expires_at)
+                            - issue_now;
+                    let token_validity = remaining_authority.to_std().map_err(|_| {
+                        runtime_error(
+                            ErrorCode::LeaseInactive,
+                            "authority expired before Nexus token issuance",
+                        )
+                    })?;
+                    let token_validity = std::cmp::min(TOKEN_VALIDITY, token_validity);
+                    if token_validity.is_zero() {
+                        return Err(runtime_error(
+                            ErrorCode::LeaseInactive,
+                            "authority expired before Nexus token issuance",
+                        ));
+                    }
 
-                self.store.consume_authorization(
-                    &authorized.certificate.authorization_record_id,
-                    authorized.certificate.authorization_generation,
-                )?;
-                on_authorization_consumed();
-                Ok((hypervisor, tokens))
-            },
-        )?;
+                    // Pinned Nexus has no public token-revocation API. A per-call
+                    // hypervisor confines its capability manager and bearer tokens
+                    // to this execution. Any error in this closure drops both.
+                    let (hypervisor, tokens) = self.store.consume_authorization_with(
+                        &authorized.certificate.authorization_record_id,
+                        authorized.certificate.authorization_generation,
+                        || self.issue_tokens(&authorized.required_capabilities, token_validity),
+                    )?;
+                    #[cfg(test)]
+                    if let Some(hook) = hooks
+                        .and_then(|hooks| hooks.after_authorization_consumed_under_guard.as_ref())
+                    {
+                        catch_unwind(AssertUnwindSafe(|| hook())).map_err(|_| {
+                            runtime_error(ErrorCode::Internal, "execution test hook panicked")
+                        })?;
+                    }
+                    Ok((hypervisor, tokens))
+                },
+            )
+            .map_err(PositionedExecutionError::before_nexus)?;
+
+        // The single-use authorization is already irreversibly consumed. Only
+        // after the authority read guard is released may evidence be appended.
+        // If this append fails, the per-call hypervisor and tokens are dropped;
+        // retry remains impossible because the authorization stays consumed.
+        self.store
+            .append_for_attempt(attempt_id, crate::MissionEventKind::AuthorizationConsumed)
+            .map_err(PositionedExecutionError::before_nexus)?;
 
         let tool_definition = registered_tool.tool_definition();
-        on_execution_started();
+        self.store
+            .append_for_attempt(attempt_id, crate::MissionEventKind::ExecutionStarted)
+            .map_err(PositionedExecutionError::before_nexus)?;
         self.metrics.nexus_execution();
         hypervisor
             .execute_tool_with_tokens(tool_definition, authorized.arguments, &tokens)
             .await
-            .map_err(|_| runtime_error(ErrorCode::ExecutionFailed, "Nexus execution failed"))
+            .map_err(|_| {
+                PositionedExecutionError::started(runtime_error(
+                    ErrorCode::ExecutionFailed,
+                    "Nexus execution failed",
+                ))
+            })
+    }
+
+    fn issue_tokens(
+        &self,
+        required_capabilities: &[Capability],
+        token_validity: Duration,
+    ) -> Result<(NexusHypervisor, Vec<CapabilityToken>), RuntimeError> {
+        let hypervisor = NexusHypervisor::new(self.hypervisor_config.clone()).map_err(|_| {
+            runtime_error(ErrorCode::ExecutionFailed, "Nexus initialization failed")
+        })?;
+        let mut tokens = Vec::with_capacity(required_capabilities.len());
+        for capability in required_capabilities.iter().cloned() {
+            let token = hypervisor
+                .issue_token(capability, "aeon-r2", token_validity)
+                .map_err(|_| {
+                    runtime_error(ErrorCode::ExecutionFailed, "Nexus token issuance failed")
+                })?;
+            self.metrics.token_issued();
+            tokens.push(token);
+        }
+        Ok((hypervisor, tokens))
     }
 }
 

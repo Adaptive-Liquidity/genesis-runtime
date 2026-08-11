@@ -1,11 +1,53 @@
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as ShaDigest, Sha256};
 
 use crate::authority::{LeaseRef, SignatureBytes};
 use crate::digest::{canonical_bytes, canonical_digest, CanonicalJson, Digest};
-use crate::error::Result;
+use crate::error::{ErrorCode, Result, RuntimeError};
 use crate::ids::{AgentId, AuthorizationId, CertificateId, LeaseId, MissionId, ToolId};
+
+pub const MAX_ACTION_TARGET_BYTES: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ActionTarget(String);
+
+impl ActionTarget {
+    pub fn new(value: impl AsRef<str>) -> Result<Self> {
+        let value = value.as_ref();
+        if value.trim().is_empty() || value.len() > MAX_ACTION_TARGET_BYTES {
+            return Err(RuntimeError::new(
+                ErrorCode::InvalidInput,
+                format!("action target must contain 1 to {MAX_ACTION_TARGET_BYTES} bytes"),
+            ));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(RuntimeError::new(
+                ErrorCode::InvalidInput,
+                "action target must not contain control characters",
+            ));
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ActionTarget {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,7 +70,7 @@ pub enum SemanticScope {
 pub struct CanonicalAction {
     pub mission_id: MissionId,
     pub effect_kind: EffectClass,
-    pub target: String,
+    pub target: ActionTarget,
     pub normalized_parameters: CanonicalJson,
     pub semantic_scope: SemanticScope,
 }
@@ -148,42 +190,6 @@ pub struct ActionCertificate {
 }
 
 impl ActionCertificate {
-    #[allow(clippy::too_many_arguments)]
-    pub fn unsigned_fixture(
-        certificate_id: CertificateId,
-        mission_id: MissionId,
-        agent_id: AgentId,
-        authority_lease_id: LeaseId,
-        action_ref: ActionRef,
-        tool_id: ToolId,
-        tool_manifest_digest: Digest,
-        concrete_input_digest: Digest,
-        authorization_record_id: AuthorizationId,
-        issued_at: DateTime<Utc>,
-    ) -> Self {
-        let agent_identity_digest = fixture_agent_identity_digest(&agent_id);
-        let expires_at = issued_at + Duration::minutes(5);
-        Self {
-            certificate_id,
-            mission_id,
-            agent_identity_digest,
-            authority_lease_id,
-            organization_version: 1,
-            policy_epoch: 0,
-            semantic_context_digest: Digest::new([0; 32]),
-            action_ref,
-            tool_id,
-            tool_manifest_digest,
-            concrete_input_digest,
-            authorization_record_id,
-            granted_uses: 1,
-            authorization_generation: 0,
-            issued_at,
-            expires_at,
-            signature: SignatureBytes::new(Vec::new()),
-        }
-    }
-
     pub fn signing_payload(&self) -> Result<Vec<u8>> {
         #[derive(Serialize)]
         struct SigningPayload<'a> {
@@ -204,36 +210,46 @@ impl ActionCertificate {
             issued_at: &'a DateTime<Utc>,
             expires_at: &'a DateTime<Utc>,
         }
+        let ActionCertificate {
+            certificate_id,
+            mission_id,
+            agent_identity_digest,
+            authority_lease_id,
+            organization_version,
+            policy_epoch,
+            semantic_context_digest,
+            action_ref,
+            tool_id,
+            tool_manifest_digest,
+            concrete_input_digest,
+            authorization_record_id,
+            granted_uses,
+            authorization_generation,
+            issued_at,
+            expires_at,
+            signature: _,
+        } = self;
+
         canonical_bytes(
             "aeon-action-certificate-v1",
             &SigningPayload {
-                certificate_id: &self.certificate_id,
-                mission_id: &self.mission_id,
-                agent_identity_digest: &self.agent_identity_digest,
-                authority_lease_id: &self.authority_lease_id,
-                organization_version: self.organization_version,
-                policy_epoch: self.policy_epoch,
-                semantic_context_digest: &self.semantic_context_digest,
-                action_ref: &self.action_ref,
-                tool_id: &self.tool_id,
-                tool_manifest_digest: &self.tool_manifest_digest,
-                concrete_input_digest: &self.concrete_input_digest,
-                authorization_record_id: &self.authorization_record_id,
-                granted_uses: self.granted_uses,
-                authorization_generation: self.authorization_generation,
-                issued_at: &self.issued_at,
-                expires_at: &self.expires_at,
+                certificate_id,
+                mission_id,
+                agent_identity_digest,
+                authority_lease_id,
+                organization_version: *organization_version,
+                policy_epoch: *policy_epoch,
+                semantic_context_digest,
+                action_ref,
+                tool_id,
+                tool_manifest_digest,
+                concrete_input_digest,
+                authorization_record_id,
+                granted_uses: *granted_uses,
+                authorization_generation: *authorization_generation,
+                issued_at,
+                expires_at,
             },
         )
     }
-}
-
-fn fixture_agent_identity_digest(agent_id: &AgentId) -> Digest {
-    const DOMAIN: &[u8] = b"aeon-agent-identity-fixture-v1";
-    let mut hasher = Sha256::new();
-    hasher.update((DOMAIN.len() as u32).to_be_bytes());
-    hasher.update(DOMAIN);
-    hasher.update((agent_id.as_str().len() as u64).to_be_bytes());
-    hasher.update(agent_id.as_str().as_bytes());
-    Digest::new(hasher.finalize().into())
 }

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use nexus::Capability;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::digest::{canonical_bytes, canonical_digest, canonical_value_bytes, Digest};
 use crate::error::{ErrorCode, Result, RuntimeError};
@@ -13,10 +13,10 @@ pub struct AuthorityRequest {
     pub capabilities: Vec<Capability>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthoritySet {
-    pub capabilities: Vec<Capability>,
+    capabilities: Vec<Capability>,
 }
 
 impl AuthoritySet {
@@ -35,6 +35,10 @@ impl AuthoritySet {
         })
     }
 
+    pub fn capabilities(&self) -> &[Capability] {
+        &self.capabilities
+    }
+
     pub fn covers(&self, required: &Capability) -> bool {
         self.capabilities
             .iter()
@@ -45,6 +49,22 @@ impl AuthoritySet {
         self.capabilities
             .iter()
             .all(|capability| parent.covers(capability))
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthoritySet {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SerializedAuthoritySet {
+            capabilities: Vec<Capability>,
+        }
+
+        let serialized = SerializedAuthoritySet::deserialize(deserializer)?;
+        Self::new(serialized.capabilities).map_err(serde::de::Error::custom)
     }
 }
 
@@ -166,38 +186,55 @@ impl AuthorityLeaseCertificate {
             renewed_from: &'a Option<LeaseRef>,
             organization_version: u64,
             policy_epoch: u64,
-            granted_authority: AuthoritySet,
-            delegable_authority: AuthoritySet,
+            granted_authority: &'a AuthoritySet,
+            delegable_authority: &'a AuthoritySet,
             capability_manifest_digest: &'a Digest,
             semantic_context_digest: &'a Digest,
             issued_at: &'a DateTime<Utc>,
             expires_at: &'a DateTime<Utc>,
         }
 
+        let AuthorityLeaseCertificate {
+            lease_id,
+            mission_id,
+            agent_id,
+            parent_agent_id,
+            agent_identity_digest,
+            issuer_identity_digest,
+            issuer_key_id,
+            parent_lease,
+            renewed_from,
+            organization_version,
+            policy_epoch,
+            granted_authority,
+            delegable_authority,
+            capability_manifest_digest,
+            semantic_context_digest,
+            issued_at,
+            expires_at,
+            signature: _,
+        } = self;
+
         canonical_bytes(
             "aeon-authority-lease-certificate-v2",
             &SigningPayload {
-                lease_id: &self.lease_id,
-                mission_id: &self.mission_id,
-                agent_id: &self.agent_id,
-                parent_agent_id: &self.parent_agent_id,
-                agent_identity_digest: &self.agent_identity_digest,
-                issuer_identity_digest: &self.issuer_identity_digest,
-                issuer_key_id: &self.issuer_key_id,
-                parent_lease: &self.parent_lease,
-                renewed_from: &self.renewed_from,
-                organization_version: self.organization_version,
-                policy_epoch: self.policy_epoch,
-                granted_authority: AuthoritySet {
-                    capabilities: canonical_capabilities(&self.granted_authority.capabilities)?,
-                },
-                delegable_authority: AuthoritySet {
-                    capabilities: canonical_capabilities(&self.delegable_authority.capabilities)?,
-                },
-                capability_manifest_digest: &self.capability_manifest_digest,
-                semantic_context_digest: &self.semantic_context_digest,
-                issued_at: &self.issued_at,
-                expires_at: &self.expires_at,
+                lease_id,
+                mission_id,
+                agent_id,
+                parent_agent_id,
+                agent_identity_digest,
+                issuer_identity_digest,
+                issuer_key_id,
+                parent_lease,
+                renewed_from,
+                organization_version: *organization_version,
+                policy_epoch: *policy_epoch,
+                granted_authority,
+                delegable_authority,
+                capability_manifest_digest,
+                semantic_context_digest,
+                issued_at,
+                expires_at,
             },
         )
     }

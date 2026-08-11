@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
@@ -98,6 +98,16 @@ pub struct AuthorityEvent {
 
 #[derive(Clone)]
 pub struct AuthorityKernel {
+    // F2 residual: DEFERRED BY DESIGN — R6 concurrency/scheduler hardening.
+    // Under adversarial/highly concurrent reader admission, std::sync::RwLock does not provide a bounded control-plane writer acquisition guarantee. R2 preserves correct revoke-vs-commit linearization but does not claim bounded revocation latency under arbitrary concurrent admission.
+    // R6 acceptance criteria:
+    // 1. A pending control-plane writer is not starved by an unlimited stream of new protected commits.
+    // 2. Reader/writer admission is deterministic.
+    // 3. Revoke-first interleavings reject execution.
+    // 4. Commit-first interleavings allow only the execution already linearized under the protected commit guard.
+    // 5. All future executions reject after revocation.
+    // 6. Writer acquisition is bounded under a documented concurrency bound.
+    // 7. Deterministic adversarial concurrency tests cover these guarantees.
     inner: Arc<RwLock<AuthorityState>>,
 }
 
@@ -466,7 +476,7 @@ impl AuthorityKernel {
 
     pub fn refresh_expirations(&self, now: DateTime<Utc>) -> Result<Vec<LeaseId>> {
         let mut state = self.write_state()?;
-        let due = state
+        let mut due = state
             .leases
             .iter()
             .filter(|(_, entry)| {
@@ -475,6 +485,7 @@ impl AuthorityKernel {
             })
             .map(|(lease_id, _)| lease_id.clone())
             .collect::<Vec<_>>();
+        due.sort();
         let mut expired = Vec::new();
         for lease_id in due {
             let entry = state.leases.get_mut(&lease_id).ok_or_else(|| {
@@ -817,6 +828,117 @@ fn validate_renewal_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::InMemoryKeyCustody;
+    use crate::ids::KeyId;
+
+    #[test]
+    fn manifest_attenuation_rejects_parent_child_version_drift() -> Result<()> {
+        let parent = CapabilityManifest {
+            version: 1,
+            model_manifest_digest: canonical_digest("manifest-version-test-v1", &"model")?,
+            approved_tools: Vec::new(),
+            permissions: crate::authority::PermissionSet {
+                capabilities: Vec::new(),
+            },
+            runtime_config_digest: canonical_digest("manifest-version-test-v1", &"runtime")?,
+            tool_registry_root_digest: canonical_digest("manifest-version-test-v1", &"registry")?,
+        };
+        let child = CapabilityManifest {
+            version: 2,
+            ..parent.clone()
+        };
+
+        let error = validate_manifest_attenuation(&child, &parent).unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::CapabilityManifestMismatch);
+        Ok(())
+    }
+
+    #[test]
+    fn identity_verification_cache_is_traversal_local_and_only_records_complete_chains(
+    ) -> Result<()> {
+        let now = Utc::now();
+        let root_agent_id = AgentId::new("agent-cache-depth-1")?;
+        let mut parent_agent_id = root_agent_id.clone();
+        let mut parent_custody: Arc<dyn KeyCustody> = Arc::new(InMemoryKeyCustody::generate(
+            KeyId::new("key-cache-depth-1")?,
+        )?);
+        let root_identity = signed_identity(
+            root_agent_id.clone(),
+            parent_custody.as_ref(),
+            None,
+            parent_custody.as_ref(),
+            now,
+        )?;
+        let mut identities = HashMap::from([(root_agent_id.clone(), root_identity)]);
+        let mut agent_ids = vec![root_agent_id.clone()];
+        for depth in 2..=MAX_AUTHORITY_CHAIN_DEPTH {
+            let agent_id = AgentId::new(format!("agent-cache-depth-{depth}"))?;
+            let custody: Arc<dyn KeyCustody> = Arc::new(InMemoryKeyCustody::generate(KeyId::new(
+                format!("key-cache-depth-{depth}"),
+            )?)?);
+            let identity = signed_identity(
+                agent_id.clone(),
+                custody.as_ref(),
+                Some(parent_agent_id),
+                parent_custody.as_ref(),
+                now,
+            )?;
+            identities.insert(agent_id.clone(), identity);
+            agent_ids.push(agent_id.clone());
+            parent_agent_id = agent_id;
+            parent_custody = custody;
+        }
+        let leaf_agent_id = agent_ids.last().cloned().expect("depth is non-zero");
+        let mut state = AuthorityState {
+            mission: MissionEnvelope {
+                mission_id: crate::ids::MissionId::new("mission-cache-test")?,
+                allowed_tools: Vec::new(),
+                allowed_capabilities: Vec::new(),
+                policy_epoch: 1,
+                organization_version: 1,
+                active: true,
+                expires_at: now + chrono::Duration::minutes(1),
+                max_actions: 1,
+            },
+            root_lease_id: LeaseId::new("lease-cache-test")?,
+            identities,
+            custodians: HashMap::new(),
+            leases: HashMap::new(),
+            events: Vec::new(),
+        };
+        let valid_root = state
+            .identities
+            .get(&root_agent_id)
+            .cloned()
+            .expect("root identity exists");
+        state
+            .identities
+            .get_mut(&root_agent_id)
+            .expect("root identity exists")
+            .agent_id = AgentId::new("agent-cache-tampered-root")?;
+        let mut successful = HashSet::new();
+        reset_identity_signature_verification_count();
+        assert!(validate_identity_chain(&state, &leaf_agent_id, &mut successful).is_err());
+        assert!(successful.is_empty());
+
+        state.identities.insert(root_agent_id, valid_root);
+        reset_identity_signature_verification_count();
+        validate_identity_chain(&state, &leaf_agent_id, &mut successful)?;
+        assert_eq!(
+            identity_signature_verification_count(),
+            MAX_AUTHORITY_CHAIN_DEPTH
+        );
+        for agent_id in &agent_ids {
+            validate_identity_chain(&state, agent_id, &mut successful)?;
+        }
+        assert_eq!(successful.len(), MAX_AUTHORITY_CHAIN_DEPTH);
+        assert_eq!(
+            identity_signature_verification_count(),
+            MAX_AUTHORITY_CHAIN_DEPTH
+        );
+        Ok(())
+    }
 
     #[test]
     fn events_fail_closed_when_authority_state_lock_is_poisoned() {

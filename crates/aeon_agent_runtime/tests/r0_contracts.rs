@@ -1,16 +1,18 @@
 use std::path::PathBuf;
 
 use aeon_agent_runtime::{
-    canonical_digest, validate_context_continuation, ActionCertificate, AgentId, AgentSpec,
-    AuthorityRequest, AuthoritySet, AuthorizationId, AuthorizationState, BoundTool, Budget,
-    CanonicalAction, CanonicalJson, CapabilityManifest, CertificateId, ContextTransition, Contract,
-    Digest, EffectClass, EffectState, InstructionProfileRef, KeyId, LeaseId, LeaseRecord,
-    LeaseState, MemoryRef, MissionId, ModelRef, Objective, PermissionSet, ProtocolGate,
-    ResourceRequest, RetrievalIndexRef, Role, SemanticContext, SemanticRequirements, SemanticScope,
-    ToolId, ToolManifest,
+    canonical_digest, validate_context_continuation, ActionCertificate, ActionTarget, AgentId,
+    AgentMessage, AgentSpec, AuthorityRequest, AuthoritySet, AuthorizationId, AuthorizationState,
+    BoundTool, Budget, CanonicalAction, CanonicalJson, CapabilityManifest, CertificateId,
+    ContextTransition, Contract, Digest, EffectClass, EffectState, InMemoryKeyCustody,
+    InstructionProfileRef, KeyCustody, KeyId, LeaseId, LeaseRecord, LeaseState, MemoryRef,
+    MissionId, ModelRef, Objective, PermissionSet, ProtocolGate, ResourceRequest,
+    RetrievalIndexRef, Role, SemanticContext, SemanticRequirements, SemanticScope, SignatureBytes,
+    ToolId, ToolManifest, MAX_ACTION_TARGET_BYTES, MAX_AGENT_STEPS, MAX_REQUESTED_CAPABILITIES,
+    MAX_REQUESTED_TOOLS,
 };
 use chrono::{Duration, TimeZone, Utc};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use nexus::Capability;
 use rand::rngs::OsRng;
 use serde_json::json;
@@ -58,6 +60,31 @@ fn sample_spec() -> AgentSpec {
     }
 }
 
+fn sample_action_certificate(
+    issued_at: chrono::DateTime<Utc>,
+    action_ref: aeon_agent_runtime::ActionRef,
+) -> ActionCertificate {
+    ActionCertificate {
+        certificate_id: CertificateId::new("cert-1").unwrap(),
+        mission_id: MissionId::new("mission-1").unwrap(),
+        agent_identity_digest: digest("agent-identity"),
+        authority_lease_id: LeaseId::new("lease-1").unwrap(),
+        organization_version: 1,
+        policy_epoch: 7,
+        semantic_context_digest: digest("context"),
+        action_ref,
+        tool_id: tool_id("fixture.echo"),
+        tool_manifest_digest: digest("tool"),
+        concrete_input_digest: digest("input"),
+        authorization_record_id: AuthorizationId::new("auth-1").unwrap(),
+        granted_uses: 1,
+        authorization_generation: 0,
+        issued_at,
+        expires_at: issued_at + Duration::minutes(5),
+        signature: SignatureBytes::new(Vec::new()),
+    }
+}
+
 #[test]
 fn typed_ids_json_round_trip() {
     let fixtures = json!({
@@ -85,6 +112,8 @@ fn agent_spec_rejects_lifecycle_credentials_and_duplicate_sources() {
     assert!(object.contains_key("requested_tools"));
     assert!(!object.contains_key("lifecycle"));
     assert!(!object.contains_key("credentials"));
+    assert!(!object.contains_key("mission"));
+    assert!(!object.contains_key("mission_envelope"));
 
     for (field, injected) in [
         ("lifecycle", json!("active")),
@@ -105,6 +134,99 @@ fn agent_spec_rejects_lifecycle_credentials_and_duplicate_sources() {
         hostile["semantic_requirements"][duplicate] = json!("duplicate");
         assert!(serde_json::from_value::<AgentSpec>(hostile).is_err());
     }
+}
+
+#[test]
+fn agent_spec_enforces_bounded_untrusted_collections_and_step_budget() {
+    let mut spec = sample_spec();
+    spec.requested_tools = (0..MAX_REQUESTED_TOOLS)
+        .map(|index| tool_id(&format!("fixture.tool-{index}")))
+        .collect();
+    assert!(spec.validate().is_ok());
+    spec.requested_tools
+        .push(tool_id(&format!("fixture.tool-{MAX_REQUESTED_TOOLS}")));
+    assert_eq!(
+        spec.validate().unwrap_err().code(),
+        aeon_agent_runtime::ErrorCode::InvalidInput
+    );
+
+    let mut spec = sample_spec();
+    spec.requested_tools.push(tool_id("fixture.echo"));
+    assert_eq!(
+        spec.validate().unwrap_err().code(),
+        aeon_agent_runtime::ErrorCode::DuplicateTool
+    );
+
+    let mut spec = sample_spec();
+    spec.requested_authority.capabilities = (0..MAX_REQUESTED_CAPABILITIES)
+        .map(|index| Capability::HttpGet(format!("https://example.test/{index}")))
+        .collect();
+    assert!(spec.validate().is_ok());
+    spec.requested_authority
+        .capabilities
+        .push(Capability::HttpGet(format!(
+            "https://example.test/{MAX_REQUESTED_CAPABILITIES}"
+        )));
+    assert_eq!(
+        spec.validate().unwrap_err().code(),
+        aeon_agent_runtime::ErrorCode::InvalidInput
+    );
+
+    let mut spec = sample_spec();
+    spec.requested_authority
+        .capabilities
+        .push(Capability::MemoryPreview);
+    assert_eq!(
+        spec.validate().unwrap_err().code(),
+        aeon_agent_runtime::ErrorCode::InvalidInput
+    );
+
+    for valid_steps in [1, MAX_AGENT_STEPS] {
+        let mut spec = sample_spec();
+        spec.resource_budget.max_steps = valid_steps;
+        assert!(spec.validate().is_ok());
+    }
+
+    for invalid_steps in [0, MAX_AGENT_STEPS + 1, u64::MAX] {
+        let mut spec = sample_spec();
+        spec.resource_budget.max_steps = invalid_steps;
+        assert_eq!(
+            spec.validate().unwrap_err().code(),
+            aeon_agent_runtime::ErrorCode::BudgetExhausted
+        );
+        assert!(serde_json::from_value::<AgentSpec>(serde_json::to_value(spec).unwrap()).is_err());
+    }
+}
+
+#[test]
+fn declarative_text_preserves_the_4096_byte_boundary() {
+    assert!(Role::new("r".repeat(4096)).is_ok());
+    assert!(Objective::new("o".repeat(4096)).is_ok());
+    assert!(Contract::new("c".repeat(4096)).is_ok());
+    assert!(Role::new("r".repeat(4097)).is_err());
+    assert!(Objective::new("o".repeat(4097)).is_err());
+    assert!(Contract::new("c".repeat(4097)).is_err());
+}
+
+#[test]
+fn action_target_is_transparent_nonempty_control_free_and_bounded() {
+    let target = ActionTarget::new("fixture.echo").expect("valid action target");
+    assert_eq!(target.as_str(), "fixture.echo");
+    assert_eq!(
+        serde_json::to_value(&target).unwrap(),
+        json!("fixture.echo")
+    );
+    assert_eq!(
+        serde_json::from_value::<ActionTarget>(json!("fixture.echo")).unwrap(),
+        target
+    );
+
+    for invalid in ["", "   ", "fixture\necho"] {
+        assert!(ActionTarget::new(invalid).is_err());
+        assert!(serde_json::from_value::<ActionTarget>(json!(invalid)).is_err());
+    }
+    assert!(ActionTarget::new("x".repeat(MAX_ACTION_TARGET_BYTES)).is_ok());
+    assert!(ActionTarget::new("x".repeat(MAX_ACTION_TARGET_BYTES + 1)).is_err());
 }
 
 #[test]
@@ -285,12 +407,8 @@ fn lease_state_is_separate_from_signed_certificate_payload() {
         renewed_from: None,
         organization_version: 1,
         policy_epoch: 7,
-        granted_authority: AuthoritySet {
-            capabilities: vec![Capability::MemoryPreview],
-        },
-        delegable_authority: AuthoritySet {
-            capabilities: vec![],
-        },
+        granted_authority: AuthoritySet::new(vec![Capability::MemoryPreview]).unwrap(),
+        delegable_authority: AuthoritySet::new(vec![]).unwrap(),
         capability_manifest_digest: digest("manifest"),
         semantic_context_digest: digest("context"),
         issued_at,
@@ -331,12 +449,8 @@ fn lease_certificate_signature_detects_signed_field_mutation() {
         renewed_from: None,
         organization_version: 1,
         policy_epoch: 7,
-        granted_authority: AuthoritySet {
-            capabilities: vec![Capability::MemoryPreview],
-        },
-        delegable_authority: AuthoritySet {
-            capabilities: vec![],
-        },
+        granted_authority: AuthoritySet::new(vec![Capability::MemoryPreview]).unwrap(),
+        delegable_authority: AuthoritySet::new(vec![]).unwrap(),
         capability_manifest_digest: digest("manifest"),
         semantic_context_digest: digest("context"),
         issued_at,
@@ -365,7 +479,7 @@ fn actions_and_certificates_are_canonical_and_state_types_are_distinct() {
     let action_a = CanonicalAction {
         mission_id: MissionId::new("mission-1").unwrap(),
         effect_kind: EffectClass::ReadOnly,
-        target: "fixture.echo".into(),
+        target: ActionTarget::new("fixture.echo").unwrap(),
         normalized_parameters: CanonicalJson::new(json!({"b":2,"a":1})),
         semantic_scope: SemanticScope::Mission,
     };
@@ -379,18 +493,7 @@ fn actions_and_certificates_are_canonical_and_state_types_are_distinct() {
     );
 
     let issued_at = Utc.with_ymd_and_hms(2026, 8, 9, 12, 0, 0).unwrap();
-    let certificate = ActionCertificate::unsigned_fixture(
-        CertificateId::new("cert-1").unwrap(),
-        MissionId::new("mission-1").unwrap(),
-        AgentId::new("agent-1").unwrap(),
-        LeaseId::new("lease-1").unwrap(),
-        action_a.action_ref().unwrap(),
-        tool_id("fixture.echo"),
-        digest("tool"),
-        digest("input"),
-        AuthorizationId::new("auth-1").unwrap(),
-        issued_at,
-    );
+    let certificate = sample_action_certificate(issued_at, action_a.action_ref().unwrap());
     let encoded = serde_json::to_value(&certificate).unwrap();
     assert!(encoded.get("consumed_uses").is_none());
     let decoded: ActionCertificate = serde_json::from_value(encoded.clone()).unwrap();
@@ -411,6 +514,34 @@ fn actions_and_certificates_are_canonical_and_state_types_are_distinct() {
 }
 
 #[test]
+fn action_certificate_signature_detects_signed_field_mutation() {
+    let issued_at = Utc.with_ymd_and_hms(2026, 8, 9, 12, 0, 0).unwrap();
+    let action = CanonicalAction {
+        mission_id: MissionId::new("mission-1").unwrap(),
+        effect_kind: EffectClass::ReadOnly,
+        target: ActionTarget::new("fixture.echo").unwrap(),
+        normalized_parameters: CanonicalJson::new(json!({"value":"hello"})),
+        semantic_scope: SemanticScope::Mission,
+    };
+    let mut certificate =
+        sample_action_certificate(issued_at, action.action_ref().expect("action ref"));
+    let custody = InMemoryKeyCustody::generate(KeyId::new("key-action-signer").unwrap()).unwrap();
+    certificate.signature = custody
+        .sign(&certificate.signing_payload().unwrap())
+        .unwrap();
+    let signature = Signature::from_slice(certificate.signature.as_bytes()).unwrap();
+    let verifying_key = custody.verifying_key();
+    assert!(verifying_key
+        .verify(&certificate.signing_payload().unwrap(), &signature)
+        .is_ok());
+
+    certificate.policy_epoch += 1;
+    assert!(verifying_key
+        .verify(&certificate.signing_payload().unwrap(), &signature)
+        .is_err());
+}
+
+#[test]
 fn protocol_is_closed_and_size_bounded() {
     let gate = ProtocolGate::default();
     let valid = r#"{"kind":"tool_call","tool_id":"fixture.echo","arguments":{"value":"hello"}}"#;
@@ -421,6 +552,7 @@ fn protocol_is_closed_and_size_bounded() {
         "not-json",
         r#"{"kind":"unknown"}"#,
         r#"{"kind":"tool_call","tool_id":"fixture.echo"}"#,
+        r#"{"kind":"tool_call","tool_id":"fixture.echo","arguments":"not-an-object"}"#,
         r#"{"kind":"tool_call","tool_id":"fixture.echo","arguments":{},"wasm":"attack"}"#,
         r#"{"kind":"final","result":"done","token":"attack"}"#,
     ] {
@@ -432,6 +564,15 @@ fn protocol_is_closed_and_size_bounded() {
     assert!(gate
         .parse(&"x".repeat(gate.max_output_bytes() + 1))
         .is_err());
+}
+
+#[test]
+fn protocol_schema_digest_is_stable_and_bound_to_the_closed_message_shape() {
+    const EXPECTED_SCHEMA: &str = r#"{"kind":"tool_call","tool_id":"ToolId","arguments":"object"}|{"kind":"final","result":"string"}"#;
+    assert_eq!(
+        AgentMessage::schema_digest().unwrap(),
+        canonical_digest("aeon-agent-protocol-schema-v1", &EXPECTED_SCHEMA).unwrap()
+    );
 }
 
 #[test]

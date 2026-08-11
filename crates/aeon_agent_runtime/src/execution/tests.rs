@@ -1,4 +1,4 @@
-use std::sync::{mpsc, Arc, RwLock};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::Duration as StdDuration;
 
 use chrono::{Duration, Utc};
@@ -8,7 +8,8 @@ use serde_json::json;
 use super::*;
 use crate::{
     canonical_digest, AgentId, AuthoritySet, BoundTool, EffectClass, InMemoryKeyCustody,
-    KeyCustody, KeyId, MissionId, PermissionSet, RegisteredTool, RenewalRequest, RootLeaseRequest,
+    KeyCustody, KeyId, MissionEventKind, MissionId, PermissionSet, RegisteredTool, RenewalRequest,
+    RootLeaseRequest,
 };
 
 const TOOL_ID: &str = "fixture.commit";
@@ -182,11 +183,7 @@ async fn a_pause_after_authorize_rejects_before_nexus() {
         )
         .unwrap();
 
-    let error = fixture
-        .port
-        .execute(authorized, || {}, || {})
-        .await
-        .unwrap_err();
+    let error = fixture.port.execute(authorized, 1).await.unwrap_err();
     assert_eq!(error.code(), ErrorCode::LeaseGenerationMismatch);
     fixture.assert_no_nexus();
 }
@@ -212,11 +209,7 @@ async fn b_pause_resume_after_authorize_rejects_stale_generation_before_nexus() 
         .resume(&active.certificate.lease_id, paused.generation, Utc::now())
         .unwrap();
 
-    let error = fixture
-        .port
-        .execute(authorized, || {}, || {})
-        .await
-        .unwrap_err();
+    let error = fixture.port.execute(authorized, 1).await.unwrap_err();
     assert_eq!(error.code(), ErrorCode::LeaseGenerationMismatch);
     fixture.assert_no_nexus();
 }
@@ -239,11 +232,7 @@ async fn c_revoke_after_authorize_rejects_before_nexus() {
         )
         .unwrap();
 
-    let error = fixture
-        .port
-        .execute(authorized, || {}, || {})
-        .await
-        .unwrap_err();
+    let error = fixture.port.execute(authorized, 1).await.unwrap_err();
     assert_eq!(error.code(), ErrorCode::LeaseGenerationMismatch);
     fixture.assert_no_nexus();
 }
@@ -272,11 +261,7 @@ async fn d_renew_after_authorize_rejects_retired_lease_before_nexus() {
         )
         .unwrap();
 
-    let error = fixture
-        .port
-        .execute(authorized, || {}, || {})
-        .await
-        .unwrap_err();
+    let error = fixture.port.execute(authorized, 1).await.unwrap_err();
     assert_eq!(error.code(), ErrorCode::LeaseGenerationMismatch);
     fixture.assert_no_nexus();
 }
@@ -287,11 +272,7 @@ async fn e_semantic_drift_after_authorize_rejects_before_nexus() {
     let authorized = fixture.authorize();
     fixture.semantic_context.write().unwrap().policy_epoch += 1;
 
-    let error = fixture
-        .port
-        .execute(authorized, || {}, || {})
-        .await
-        .unwrap_err();
+    let error = fixture.port.execute(authorized, 1).await.unwrap_err();
     assert_eq!(error.code(), ErrorCode::SemanticContextChanged);
     fixture.assert_no_nexus();
 }
@@ -302,11 +283,7 @@ async fn f_tool_substitution_after_authorize_rejects_before_nexus() {
     let authorized = fixture.authorize();
     fixture.registry.replace(registered_tool(2)).unwrap();
 
-    let error = fixture
-        .port
-        .execute(authorized, || {}, || {})
-        .await
-        .unwrap_err();
+    let error = fixture.port.execute(authorized, 1).await.unwrap_err();
     assert_eq!(error.code(), ErrorCode::ToolManifestMismatch);
     fixture.assert_no_nexus();
 }
@@ -321,18 +298,33 @@ async fn g_barrier_synchronized_double_consumption_has_one_success_and_one_nexus
     let first_authorized = authorized.clone();
     let first_barrier = barrier.clone();
     let first = tokio::spawn(async move {
-        first_barrier.wait().await;
-        first_port.execute(first_authorized, || {}, || {}).await
+        tokio::time::timeout(StdDuration::from_secs(2), first_barrier.wait())
+            .await
+            .expect("first execution barrier timed out");
+        first_port.execute(first_authorized, 1).await
     });
     let second_port = fixture.port.clone();
     let second_barrier = barrier.clone();
     let second = tokio::spawn(async move {
-        second_barrier.wait().await;
-        second_port.execute(authorized, || {}, || {}).await
+        tokio::time::timeout(StdDuration::from_secs(2), second_barrier.wait())
+            .await
+            .expect("second execution barrier timed out");
+        second_port.execute(authorized, 1).await
     });
-    barrier.wait().await;
+    tokio::time::timeout(StdDuration::from_secs(2), barrier.wait())
+        .await
+        .expect("coordinator barrier timed out");
 
-    let results = [first.await.unwrap(), second.await.unwrap()];
+    let results = [
+        tokio::time::timeout(StdDuration::from_secs(2), first)
+            .await
+            .expect("first execution timed out")
+            .unwrap(),
+        tokio::time::timeout(StdDuration::from_secs(2), second)
+            .await
+            .expect("second execution timed out")
+            .unwrap(),
+    ];
     assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
     assert_eq!(
         results
@@ -343,7 +335,7 @@ async fn g_barrier_synchronized_double_consumption_has_one_success_and_one_nexus
         1
     );
     let metrics = fixture.metrics.snapshot();
-    assert_eq!(metrics.token_issues, 2);
+    assert_eq!(metrics.token_issues, 1);
     assert_eq!(metrics.nexus_executions, 1);
 }
 
@@ -357,16 +349,23 @@ async fn h_commit_first_revoke_blocks_then_future_execution_rejects() {
         .unwrap();
     let (consumed_tx, consumed_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
     let port = fixture.port.clone();
     let first_authorized = authorized.clone();
     let execution = tokio::spawn(async move {
-        port.execute(
+        port.execute_with_test_hooks(
             first_authorized,
-            move || {
-                consumed_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
+            1,
+            ExecutionTestHooks {
+                after_authorization_consumed_under_guard: Some(Arc::new(move || {
+                    consumed_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(StdDuration::from_secs(2))
+                        .expect("commit cutpoint release timed out");
+                })),
             },
-            || {},
         )
         .await
     });
@@ -375,8 +374,10 @@ async fn h_commit_first_revoke_blocks_then_future_execution_rejects() {
         .expect("execution did not reach the authorization-consumed cutpoint");
 
     let kernel = fixture.authority_kernel.clone();
+    let (started_tx, started_rx) = mpsc::channel();
     let (revoked_tx, revoked_rx) = mpsc::channel();
     let revocation = tokio::task::spawn_blocking(move || {
+        started_tx.send(()).unwrap();
         let result = kernel.revoke(
             &active.certificate.lease_id,
             active.record.generation,
@@ -386,24 +387,96 @@ async fn h_commit_first_revoke_blocks_then_future_execution_rejects() {
         revoked_tx.send(()).unwrap();
         result
     });
+    started_rx
+        .recv_timeout(StdDuration::from_secs(2))
+        .expect("revocation thread did not start");
     assert!(revoked_rx
         .recv_timeout(StdDuration::from_millis(100))
         .is_err());
 
     release_tx.send(()).unwrap();
-    assert!(execution.await.unwrap().is_ok());
-    revocation.await.unwrap().unwrap();
+    assert!(tokio::time::timeout(StdDuration::from_secs(2), execution)
+        .await
+        .expect("execution timed out")
+        .unwrap()
+        .is_ok());
+    tokio::time::timeout(StdDuration::from_secs(2), revocation)
+        .await
+        .expect("revocation timed out")
+        .unwrap()
+        .unwrap();
     let committed_metrics = fixture.metrics.snapshot();
     assert_eq!(committed_metrics.token_issues, 1);
     assert_eq!(committed_metrics.nexus_executions, 1);
 
-    let error = fixture
-        .port
-        .execute(authorized, || {}, || {})
-        .await
-        .unwrap_err();
+    let error = fixture.port.execute(authorized, 2).await.unwrap_err();
     assert_eq!(error.code(), ErrorCode::LeaseGenerationMismatch);
     let rejected_metrics = fixture.metrics.snapshot();
     assert_eq!(rejected_metrics.token_issues, 1);
     assert_eq!(rejected_metrics.nexus_executions, 1);
+}
+
+#[tokio::test]
+async fn i_authorization_consumed_evidence_failure_is_fail_closed_and_not_reissuable() {
+    let fixture = CommitFixture::new();
+    let authorized = fixture.authorize();
+    fixture.store.fail_next_event_append_for_test();
+
+    let error = fixture
+        .port
+        .execute(authorized.clone(), 1)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), ErrorCode::Internal);
+    assert_eq!(error.position(), ExecutionPosition::BeforeNexus);
+    assert_eq!(fixture.metrics.snapshot().token_issues, 1);
+    assert_eq!(fixture.metrics.snapshot().nexus_executions, 0);
+    assert!(!fixture.store.event_kinds().unwrap().iter().any(|kind| {
+        matches!(
+            kind,
+            MissionEventKind::AuthorizationConsumed | MissionEventKind::ExecutionStarted
+        )
+    }));
+    let records = fixture.store.authorization_records().unwrap();
+    assert_eq!(records[0].state, AuthorizationState::Consumed);
+    assert_eq!(records[0].remaining_budget.actions, 0);
+
+    let retry = fixture.port.execute(authorized, 2).await.unwrap_err();
+    assert_eq!(retry.code(), ErrorCode::AuthorizationInvalid);
+    assert_eq!(retry.position(), ExecutionPosition::BeforeNexus);
+    assert_eq!(fixture.metrics.snapshot().token_issues, 1);
+    assert_eq!(fixture.metrics.snapshot().nexus_executions, 0);
+}
+
+#[tokio::test]
+async fn j_panicking_test_hook_is_caught_after_single_use_consumption() {
+    let fixture = CommitFixture::new();
+    let authorized = fixture.authorize();
+
+    let error = fixture
+        .port
+        .execute_with_test_hooks(
+            authorized.clone(),
+            1,
+            ExecutionTestHooks {
+                after_authorization_consumed_under_guard: Some(Arc::new(|| {
+                    panic!("deterministic test-hook panic")
+                })),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), ErrorCode::Internal);
+    assert_eq!(error.position(), ExecutionPosition::BeforeNexus);
+    assert_eq!(fixture.metrics.snapshot().nexus_executions, 0);
+    assert_eq!(
+        fixture.store.authorization_records().unwrap()[0].state,
+        AuthorizationState::Consumed
+    );
+
+    let retry = fixture.port.execute(authorized, 2).await.unwrap_err();
+    assert_eq!(retry.code(), ErrorCode::AuthorizationInvalid);
+    assert_eq!(fixture.metrics.snapshot().nexus_executions, 0);
 }

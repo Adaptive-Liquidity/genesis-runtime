@@ -1,17 +1,20 @@
 use std::sync::Arc;
 
+mod common;
+
 use aeon_agent_runtime::{
     canonical_bytes, canonical_digest, ActionRef, AgentId, AgentIdentity, AgentIdentityCertificate,
     AgentLifecycle, AgentRuntimeRecord, AgentSpec, AuthorityLeaseCertificate, AuthorityRequest,
     AuthoritySet, AuthorizationId, AuthorizationRecord, AuthorizationState, Budget, CanonicalJson,
-    Contract, Digest, EffectClass, ErrorCode, InMemoryKeyCustody, InMemoryMissionStore,
-    InstructionProfileRef, KeyCustody, KeyId, LeaseId, LeaseRecord, LeaseRef, MemoryEntry,
-    MemoryTrust, MissionEnvelope, MissionEventKind, MissionId, ModelClient, ModelRef, ModelRequest,
-    Objective, ProtocolGate, RegisteredTool, ResourceRequest, Role, RuntimeError,
-    ScriptedModelClient, SecurityLevel, SemanticContext, SemanticRequirements, SignatureBytes,
-    ToolId, ToolRegistry,
+    CertificateId, Contract, Digest, EffectClass, ErrorCode, InMemoryKeyCustody,
+    InMemoryMissionStore, InstructionProfileRef, KeyCustody, KeyId, LeaseId, LeaseRecord, LeaseRef,
+    MemoryEntry, MemoryRef, MemoryTrust, MissionEnvelope, MissionEventKind, MissionId, ModelClient,
+    ModelRef, ModelRequest, Objective, ProtocolGate, RegisteredTool, ResourceRequest,
+    RetrievalIndexRef, Role, RuntimeError, SecurityLevel, SemanticContext, SemanticRequirements,
+    SignatureBytes, ToolId, ToolRegistry,
 };
 use chrono::{Duration, Utc};
+use common::ScriptedModelClient;
 use nexus::Capability;
 use serde_json::json;
 
@@ -149,6 +152,7 @@ fn digest_hex_bytes_and_canonical_json_edges_are_validated() {
     let decoded: CanonicalJson = serde_json::from_str(&encoded).unwrap();
     assert_eq!(decoded.into_value(), canonical.into_value());
     assert!(canonical_digest("", &json!({})).is_err());
+    assert!(canonical_bytes("", &json!({})).is_err());
     let framed = canonical_bytes("domain-v1", &json!({"b":2,"a":1})).unwrap();
     assert!(framed
         .windows("domain-v1".len())
@@ -157,6 +161,28 @@ fn digest_hex_bytes_and_canonical_json_edges_are_validated() {
 
 #[test]
 fn identifier_helpers_preserve_validation() {
+    macro_rules! assert_identifier_round_trip {
+        ($identifier_type:ty, $value:literal) => {{
+            let identifier: $identifier_type = <$identifier_type>::new($value).unwrap();
+            let encoded = serde_json::to_value(&identifier).unwrap();
+            assert_eq!(encoded, json!($value));
+            let decoded: $identifier_type = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, identifier);
+        }};
+    }
+
+    assert_identifier_round_trip!(MissionId, "mission-typed");
+    assert_identifier_round_trip!(AgentId, "agent-typed");
+    assert_identifier_round_trip!(LeaseId, "lease-typed");
+    assert_identifier_round_trip!(AuthorizationId, "authorization-typed");
+    assert_identifier_round_trip!(CertificateId, "certificate-typed");
+    assert_identifier_round_trip!(KeyId, "key-typed");
+    assert_identifier_round_trip!(ToolId, "tool-typed");
+    assert_identifier_round_trip!(ModelRef, "model-typed");
+    assert_identifier_round_trip!(MemoryRef, "memory-typed");
+    assert_identifier_round_trip!(RetrievalIndexRef, "retrieval-index-typed");
+    assert_identifier_round_trip!(InstructionProfileRef, "instruction-profile-typed");
+
     let id = ToolId::new("fixture.echo/v1@local").unwrap();
     assert_eq!(id.as_str(), "fixture.echo/v1@local");
     assert_eq!(id.as_ref(), "fixture.echo/v1@local");
@@ -174,11 +200,24 @@ fn identifier_helpers_preserve_validation() {
 fn identity_certificates_bind_agent_key_and_issuer_without_exposing_private_keys() {
     let issuer = InMemoryKeyCustody::generate(KeyId::new("key-issuer").unwrap()).unwrap();
     let subject = InMemoryKeyCustody::generate(KeyId::new("key-subject").unwrap()).unwrap();
+    let mut issuer_certificate = AgentIdentityCertificate::unsigned(
+        AgentId::new("agent-issuer").unwrap(),
+        issuer.key_id(),
+        issuer.verifying_key(),
+        None,
+        issuer.key_id(),
+        Utc::now(),
+    );
+    issuer_certificate.signature = issuer
+        .sign(&issuer_certificate.signing_payload().unwrap())
+        .unwrap();
+    issuer_certificate.verify_self_signed().unwrap();
+
     let mut certificate = AgentIdentityCertificate::unsigned(
         AgentId::new("agent-subject").unwrap(),
         subject.key_id(),
         subject.verifying_key(),
-        Some(AgentId::new("agent-issuer").unwrap()),
+        Some(issuer_certificate.agent_id.clone()),
         issuer.key_id(),
         Utc::now(),
     );
@@ -186,28 +225,92 @@ fn identity_certificates_bind_agent_key_and_issuer_without_exposing_private_keys
         .sign(&certificate.signing_payload().unwrap())
         .unwrap();
 
-    certificate
-        .verify_signature(&issuer.verifying_key())
-        .unwrap();
+    certificate.verify_issued_by(&issuer_certificate).unwrap();
     assert_eq!(
         certificate.verifying_key().unwrap(),
         subject.verifying_key()
     );
     assert!(!certificate.canonical_digest().unwrap().to_hex().is_empty());
 
-    let debug = format!("{issuer:?}").to_ascii_lowercase();
-    assert!(debug.contains("key-issuer"));
-    assert!(!debug.contains("signing_key"));
-    assert!(!debug.contains("secret"));
-
-    certificate.agent_id = AgentId::new("agent-substituted").unwrap();
+    let serialized = serde_json::to_value(&certificate).unwrap();
+    let serialized_fields = serialized
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
-        certificate
-            .verify_signature(&issuer.verifying_key())
+        serialized_fields,
+        std::collections::BTreeSet::from([
+            "agent_id",
+            "issued_at",
+            "issuer_agent_id",
+            "issuer_key_id",
+            "key_id",
+            "signature",
+            "verifying_key_bytes",
+        ])
+    );
+    assert_eq!(
+        format!("{issuer:?}"),
+        "InMemoryKeyCustody { key_id: KeyId(\"key-issuer\"), .. }"
+    );
+
+    let mut mutated = certificate.clone();
+    mutated.agent_id = AgentId::new("agent-substituted").unwrap();
+    assert_eq!(
+        mutated
+            .verify_issued_by(&issuer_certificate)
             .unwrap_err()
             .code(),
         ErrorCode::IdentityInvalid
     );
+
+    let mut wrong_issuer = issuer_certificate.clone();
+    wrong_issuer.agent_id = AgentId::new("agent-untrusted-substitute").unwrap();
+    assert_eq!(
+        certificate
+            .verify_issued_by(&wrong_issuer)
+            .unwrap_err()
+            .code(),
+        ErrorCode::IdentityInvalid
+    );
+}
+
+#[test]
+fn identity_issuer_convenience_verification_does_not_make_a_trust_decision() {
+    let untrusted_issuer =
+        InMemoryKeyCustody::generate(KeyId::new("key-untrusted-issuer").unwrap()).unwrap();
+    let subject =
+        InMemoryKeyCustody::generate(KeyId::new("key-untrusted-subject").unwrap()).unwrap();
+    let mut issuer_certificate = AgentIdentityCertificate::unsigned(
+        AgentId::new("agent-untrusted-issuer").unwrap(),
+        untrusted_issuer.key_id(),
+        untrusted_issuer.verifying_key(),
+        None,
+        untrusted_issuer.key_id(),
+        Utc::now(),
+    );
+    issuer_certificate.signature = untrusted_issuer
+        .sign(&issuer_certificate.signing_payload().unwrap())
+        .unwrap();
+    issuer_certificate.verify_self_signed().unwrap();
+
+    let mut certificate = AgentIdentityCertificate::unsigned(
+        AgentId::new("agent-untrusted-subject").unwrap(),
+        subject.key_id(),
+        subject.verifying_key(),
+        Some(issuer_certificate.agent_id.clone()),
+        untrusted_issuer.key_id(),
+        Utc::now(),
+    );
+    certificate.signature = untrusted_issuer
+        .sign(&certificate.signing_payload().unwrap())
+        .unwrap();
+
+    // Cryptographic validity does not make this ad hoc self-signed issuer a
+    // trusted anchor. This helper checks only the subject's issuer binding.
+    certificate.verify_issued_by(&issuer_certificate).unwrap();
 }
 
 #[test]
@@ -238,6 +341,35 @@ fn authority_sets_use_nexus_attenuation_semantics() {
     assert!(parent.covers(&Capability::ReadFile("/data/reports/a.json".into())));
     assert!(!parent.is_subset_of(&child));
     assert!(AuthoritySet::new(vec![Capability::All]).is_err());
+
+    let canonical = AuthoritySet::new(vec![
+        Capability::MemoryPreview,
+        Capability::ReadFile("/data".into()),
+        Capability::MemoryPreview,
+    ])
+    .unwrap();
+    let reordered = AuthoritySet::new(vec![
+        Capability::ReadFile("/data".into()),
+        Capability::MemoryPreview,
+    ])
+    .unwrap();
+    assert_eq!(canonical.capabilities(), reordered.capabilities());
+
+    let duplicated = serde_json::to_value(AuthorityRequest {
+        capabilities: vec![
+            Capability::MemoryPreview,
+            Capability::ReadFile("/data".into()),
+            Capability::MemoryPreview,
+        ],
+    })
+    .unwrap();
+    let decoded: AuthoritySet = serde_json::from_value(duplicated).unwrap();
+    assert_eq!(decoded, canonical);
+    let forbidden = serde_json::to_value(AuthorityRequest {
+        capabilities: vec![Capability::All],
+    })
+    .unwrap();
+    assert!(serde_json::from_value::<AuthoritySet>(forbidden).is_err());
 }
 
 #[test]
@@ -356,7 +488,6 @@ fn tool_registry_rejects_bad_manifests_and_inputs() {
     assert!(ToolRegistry::from_tools(vec![base.clone(), base.clone()]).is_err());
     let registry = ToolRegistry::from_tools(vec![base]).unwrap();
     assert!(registry.resolve(&tool_id("fixture.missing")).is_err());
-    assert!(registry.replace(fixture_tool()).is_ok());
     assert!(registry.root_digest().is_ok());
 }
 
@@ -367,7 +498,7 @@ fn append_foundation(store: &InMemoryMissionStore) {
         MissionEventKind::LeaseIssued,
         MissionEventKind::AgentActivated,
     ] {
-        store.append(kind);
+        store.append(kind).unwrap();
     }
 }
 
@@ -377,7 +508,7 @@ fn append_attempt(
     events: impl IntoIterator<Item = MissionEventKind>,
 ) {
     for event in events {
-        store.append_for_attempt(attempt_id, event);
+        store.append_for_attempt(attempt_id, event).unwrap();
     }
 }
 
@@ -443,12 +574,18 @@ fn mission_store_accepts_complete_histories_across_attempt_boundaries() {
     append_foundation(&interleaved);
     let final_attempt = interleaved.begin_attempt();
     let rejected_attempt = interleaved.begin_attempt();
-    interleaved.append_for_attempt(final_attempt, MissionEventKind::ProtocolAccepted);
-    interleaved.append_for_attempt(
-        rejected_attempt,
-        MissionEventKind::ProtocolRejected(ErrorCode::MalformedProtocol),
-    );
-    interleaved.append_for_attempt(final_attempt, MissionEventKind::FinalProduced);
+    interleaved
+        .append_for_attempt(final_attempt, MissionEventKind::ProtocolAccepted)
+        .unwrap();
+    interleaved
+        .append_for_attempt(
+            rejected_attempt,
+            MissionEventKind::ProtocolRejected(ErrorCode::MalformedProtocol),
+        )
+        .unwrap();
+    interleaved
+        .append_for_attempt(final_attempt, MissionEventKind::FinalProduced)
+        .unwrap();
     interleaved.verify_event_completeness().unwrap();
 }
 
@@ -591,10 +728,9 @@ fn mission_store_keeps_agent_lease_and_authorization_records_separate() {
         lifecycle: AgentLifecycle::Active,
         current_step: 0,
         semantic_context: context,
-        semantic_context_digest: context_digest,
     };
-    store.set_agent_record(agent.clone());
-    assert_eq!(store.agent_record(), Some(agent));
+    store.set_agent_record(agent.clone()).unwrap();
+    assert_eq!(store.agent_record().unwrap(), Some(agent));
 
     let now = Utc::now();
     let certificate = AuthorityLeaseCertificate {
@@ -609,12 +745,8 @@ fn mission_store_keeps_agent_lease_and_authorization_records_separate() {
         renewed_from: None,
         organization_version: 1,
         policy_epoch: 7,
-        granted_authority: AuthoritySet {
-            capabilities: vec![Capability::MemoryPreview],
-        },
-        delegable_authority: AuthoritySet {
-            capabilities: vec![],
-        },
+        granted_authority: AuthoritySet::new(vec![Capability::MemoryPreview]).unwrap(),
+        delegable_authority: AuthoritySet::new(vec![]).unwrap(),
         capability_manifest_digest: digest("manifest"),
         semantic_context_digest: context_digest,
         issued_at: now,
@@ -622,8 +754,10 @@ fn mission_store_keeps_agent_lease_and_authorization_records_separate() {
         signature: SignatureBytes::new(vec![]),
     };
     let lease_record = LeaseRecord::active(lease_id.clone());
-    store.set_lease(certificate.clone(), lease_record.clone());
-    assert_eq!(store.lease(), Some((certificate, lease_record)));
+    store
+        .set_lease(certificate.clone(), lease_record.clone())
+        .unwrap();
+    assert_eq!(store.lease().unwrap(), Some((certificate, lease_record)));
 
     let authorization = AuthorizationRecord {
         record_id: AuthorizationId::new("auth-1").unwrap(),
@@ -640,8 +774,11 @@ fn mission_store_keeps_agent_lease_and_authorization_records_separate() {
         generation: 0,
     };
     store.insert_authorization(authorization.clone()).unwrap();
-    assert_eq!(store.authorization_records(), vec![authorization.clone()]);
-    assert_eq!(store.authorization_count(), 1);
+    assert_eq!(
+        store.authorization_records().unwrap(),
+        vec![authorization.clone()]
+    );
+    assert_eq!(store.authorization_count().unwrap(), 1);
     assert!(store.insert_authorization(authorization.clone()).is_err());
     let encoded = serde_json::to_value(&authorization).unwrap();
     assert!(encoded.get("budget").is_none());
@@ -656,6 +793,7 @@ fn mission_store_keeps_agent_lease_and_authorization_records_separate() {
     assert!(store
         .consume_authorization(&authorization.record_id, authorization.generation)
         .is_err());
-    assert_eq!(store.events().len(), 4);
-    assert!(store.verify_event_completeness().is_ok());
+    assert_eq!(store.events().unwrap().len(), 4);
+    let completeness_error = store.verify_event_completeness().unwrap_err();
+    assert_eq!(completeness_error.code(), ErrorCode::EventIncomplete);
 }
