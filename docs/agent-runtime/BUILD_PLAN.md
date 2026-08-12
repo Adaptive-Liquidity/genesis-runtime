@@ -1,5 +1,7 @@
 # Build Plan
 
+<!-- markdownlint-disable MD013 -->
+
 ## Stage control
 
 R0–R2 are complete. The control point is: **complete the evidence, validate, and
@@ -198,7 +200,12 @@ simulated interleaving. `EmergencyInterrupt` is carried forward from the old R10
 explicitly: once an emergency stop is durably committed, no new authority
 consumption, task scheduling, or external-effect release proceeds — without
 falsely promising cancellation of a Nexus call already past the commit point
-(Property~1 still governs in-flight work).
+([Architecture §4](ARCHITECTURE.md#4-the-authorization-commit-section)). The
+protected authorization commit is the linearization point: later revocation
+cannot retroactively invalidate the committed authorization consumption;
+fail-closed failures after commit may still prevent Nexus entry; once Nexus
+execution begins, later revocation does not cancel that in-flight execution; and
+later calls are governed by the revocation.
 
 The stage must also define deterministic reader/writer admission. Once
 revoke/pause/emergency writer intent is pending, an unlimited stream of new
