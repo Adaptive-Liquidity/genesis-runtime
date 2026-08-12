@@ -199,13 +199,15 @@ executes one agent. That gap is where the interesting bugs live.
 **Acceptance evidence:** concurrent execution of multiple leased agents under one
 mission; scheduler isolation evidence; deterministic `CircuitBreaker` limits
 derived from the mission envelope (active agents, spawn depth, concurrency, tool
-calls, retries, reorganizations, token/monetary budget, wall-clock) evaluated
-before every consumption-increasing operation; fail-closed `CircuitOpen`
-preserving evidence state; concurrent revocation under real parallelism, not
-simulated interleaving. `EmergencyInterrupt` is carried forward from the old R10
-explicitly: once an emergency stop is durably committed, no new authority
-consumption, task scheduling, or external-effect release proceeds — without
-falsely promising cancellation of a Nexus call already past the commit point
+calls, retries, reorganizations, token/monetary budget, wall-clock); each limit
+check and its corresponding reservation or consumption share one atomic admission
+linearization point, with concurrent boundary tests proving no mission-level
+oversubscription; fail-closed `CircuitOpen` preserving evidence state; concurrent
+revocation under real parallelism, not simulated interleaving.
+`EmergencyInterrupt` is carried forward from the old R10 explicitly: once an
+emergency stop is durably committed, no new authority consumption, task
+scheduling, or external-effect release proceeds — without falsely promising
+cancellation of a Nexus call already past the commit point
 ([Architecture §4](ARCHITECTURE.md#4-the-authorization-commit-section)). The
 protected authorization commit is the linearization point: later revocation
 cannot retroactively invalidate the committed authorization consumption;
@@ -298,6 +300,12 @@ handling that never authorizes blind replay. R10 extends R3's
 `ActionEvidenceChain` into the full transactional `EffectCertificate` chain with
 commit-decision, effect-release, effect-outcome, reconciliation, and compensation
 evidence.
+
+The effect-release path must consult the same durable `EmergencyInterrupt` state
+at its release linearization point. Integration tests must prove that an
+interrupt-first race rejects release, a release-first race permits only the
+already-linearized release, and every later release rejects after the committed
+stop.
 
 **Position honestly:** this is largely Cordon's contribution. Cite it, do not
 re-present it as novel, and describe the delta — Cordon contains a task; this
