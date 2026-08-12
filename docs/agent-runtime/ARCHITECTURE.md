@@ -369,6 +369,13 @@ MissionEnvelope (principal-signed)
                   └─> ExecutionReceipt (tool digest, Nexus revision, outcome)
 ```
 
+The chain must carry authenticated openings for every committed input needed to
+recompute the authorization decision, including the canonical capability
+manifest and relevant tool bindings, semantic context, registry snapshot or
+authenticated registry proofs, and applicable policy inputs and epochs. An
+offline verifier fails closed if any required opening is absent or cannot be
+validated without consulting the live runtime.
+
 The target API is a standalone
 `verify_action_evidence_chain(chain, trust_roots) -> Verdict` that links against
 no live runtime state, so an auditor, regulator, or counterparty can reproduce the
