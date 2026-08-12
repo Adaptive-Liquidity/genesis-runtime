@@ -44,4 +44,4 @@ The following rules are represented and exercised without assigning them an unde
 
 The evidence suite should be run with `cargo test --workspace --all-targets`. A passing run is necessary for an R0-R2 checkpoint but is not sufficient for a production or formal-verification claim.
 
-No durability, crash-stability, tamper-evidence, exactly-once, distributed-revocation, coalition-safety, implementation-proof, or formal-verification claim is made. R14 is the roadmap stage for a scoped TLA+ model check; even that would not by itself prove Rust implementation conformance or cryptographic correctness.
+No durability, crash-stability, tamper-evidence, exactly-once, distributed-revocation, coalition-safety, implementation-proof, or formal-verification claim is made. R13 is the roadmap stage for a scoped TLA+ model check; even that would not by itself prove Rust implementation conformance or cryptographic correctness.
