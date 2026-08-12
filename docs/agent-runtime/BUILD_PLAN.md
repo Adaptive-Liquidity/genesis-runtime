@@ -163,7 +163,12 @@ security surface is unchanged by design; the point is to demonstrate that.
 
 **Acceptance evidence:** the full R0–R2 rejection suite passes unmodified against
 live model output; protocol violations under real generation are rejected at the
-same point; output size bounds hold under adversarial prompting.
+same point; output size bounds hold under adversarial prompting. Every generation
+returns an immutable provider-resolved model identity or attestation that is
+checked against the model manifest bound into the authorized semantic context
+before output is accepted; a mutable alias retargeted after bootstrap must reject.
+This attestation identifies the served artifact and does not establish behavioral
+equivalence.
 
 ---
 
@@ -186,8 +191,9 @@ this runtime. Full design in ARCHITECTURE §6.
    equivalence. Shipping either class as permissive is a security regression, not
    a feature.
 5. Adversarial suite: registry extension that removes a tool while appearing to
-   add one; re-digested tool under an unchanged identifier; drift accumulated
-   through a chain of individually compatible steps.
+   add one; re-digested tool under an unchanged identifier; a newly added tool
+   exposed through the agent-visible interface; drift accumulated through a chain
+   of individually compatible steps. Each incompatible case rejects.
 
 **Stop gate.** This amends the baseline T11 rule (ARCHITECTURE §10 item 3) and
 requires protocol-owner approval before landing.
@@ -244,10 +250,15 @@ agents are actually synthesized at runtime, that claim is untested against the
 case it was designed for. This stage is a **demonstration**, not a research
 contribution — and it should be cheap, because R2 already did the hard part.
 
-**Acceptance evidence:** planner-proposed agents synthesized, delegated to,
-retired, and reorganized at runtime under load, with the full T1/T2 suite green
-throughout; a red-team attempt to escalate through synthesis, reported with
-whatever got through.
+**Acceptance evidence:** before synthesis is enabled, the principal-approved
+mission policy binds the permitted model identities/manifests, instruction
+profiles or digests, and runtime-configuration profiles or digests. Planner-
+proposed agents outside that semantic-resource policy fail closed even when the
+requested resource is registered. Conforming agents are synthesized, delegated
+to, retired, and reorganized at runtime under load, with the full T1/T2 suite
+green throughout; a red-team attempt to escalate through tools, capabilities,
+models, instructions, or runtime specialization is reported with whatever got
+through.
 
 ---
 
