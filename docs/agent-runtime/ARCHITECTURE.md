@@ -170,6 +170,12 @@ missing audit evidence. If `ExecutionStarted` evidence fails after consumption
 was recorded, the attempt terminates as `ExecutionRejectedBeforeNexus`; Nexus is
 still not entered and that distinct terminal history is complete. **[R0–R2]**
 
+That paragraph describes the live, in-memory R0–R2 guarantee. From R3 onward the
+atomic durable transaction is the authoritative recovery record: if it never
+committed, recovery may reconstruct the authorization as unconsumed only because
+Nexus entry was gated on that commit and therefore could not have occurred. A
+committed consumption remains consumed across recovery.
+
 **Writer-acquisition residual.** The standard library documents that
 [`std::sync::RwLock`](https://doc.rust-lang.org/std/sync/struct.RwLock.html) does
 not guarantee a particular priority policy. Under adversarial/highly concurrent
@@ -182,8 +188,10 @@ and adversarial concurrent revoke/commit tests are R6 requirements. The R2 lock
 and commit cutpoint are not moved to mask this liveness residual.
 
 **Bounded chains.** `MAX_AUTHORITY_CHAIN_DEPTH = 32`, inclusive, rejected before
-insertion — an unbounded delegation chain is a resource-exhaustion vector against
-the monitor itself even when every link attenuates correctly. **[R0–R2]**
+insertion. The root counts as depth one, and the bound is enforced on both lease
+and identity walks — an unbounded delegation chain is a resource-exhaustion
+vector against the monitor itself even when every link attenuates correctly.
+**[R0–R2]**
 
 ---
 
@@ -234,13 +242,17 @@ authorization class `A`. Proposed relation classes, weakest to strongest:
 | Class | Rule | Safe for |
 | --- | --- | --- |
 | `Identical` | `H(Σ) = H(Σ′)` | everything (today's behavior) |
-| `MetadataOnly` | only non-identity fields differ | everything **[R0–R2]** |
+| `MetadataOnly` | only non-identity fields differ | everything |
 | `MonotoneRegistryExtension` | tools added; none removed, mutated, or re-digested; **and no added tool is visible to this agent's bound interface** | any `A` not referencing a changed tool |
 | `CertifiedModelEquivalence` | model substituted within an equivalence class signed by a trusted equivalence authority | any `A` whose effect class tolerates it |
 | `InstructionRefinement` | instruction change proved strictly narrowing | any `A` |
 | `Incompatible` | otherwise | nothing — re-authorize |
 
 <!-- markdownlint-enable MD013 -->
+
+R0–R2 implement only the specific exclusion of the metadata-only
+`context_version` field from canonical semantic-context identity. The general
+`MetadataOnly` compatibility class is not implemented and remains an R5 target.
 
 Compatibility is **not** transitively assumed: `Σ→Σ′` and `Σ′→Σ″` compatible does
 not imply `Σ→Σ″`. Each transition is evaluated against the originally bound
@@ -325,18 +337,34 @@ to that derived effect. Any action/effect mismatch rejects. Cross-tool tests mus
 prove that semantically identical quantities against the same resource produce
 the same budget effect.
 
-Consumption reuses **the existing commit section** as its linearization point,
-reducing the new concurrency surface. R8 must still establish shared-ledger
-atomicity, canonical `ResourceScope` identity across heterogeneous tools, budget
-conservation, authority/budget interaction, no double-spend under R6
-parallelism, and adversarial concurrent behavior.
+Consumption is admitted inside **the existing commit section**, preserving its
+freshness and revoke-vs-commit ordering and reducing the new concurrency surface.
+After final revalidation and token issuance succeed, single-use authorization
+consumption, the shared-ledger read-check-debit, and the required R3 pre-entry
+evidence commit as one atomic durable transaction: either all commit or none do.
+That combined transaction is the authorization/resource-consumption
+linearization point. The authority read guard can admit concurrent commits and
+does not itself serialize aggregate budget consumption. R8 must establish that
+shared-ledger atomicity, canonical `ResourceScope` identity across heterogeneous
+tools, budget conservation, authority/budget interaction, no double-spend under
+R6 parallelism, and adversarial concurrent behavior. Once the transaction
+commits, a later fail-closed pre-Nexus failure does not release or roll back the
+authorization or resource quantity. This deliberately prefers conservative
+budget forfeiture over a compensating mutation that could reopen replay or
+double-spend.
 
 **Gated declassification.** Declassification is normally a trusted-code escape
 hatch. Here it becomes a first-class authorized effect: it consumes a budgeted
-authorization, emits a signed receipt naming the labels crossed and the
-authorizing principal, and is refused when the declassification budget is
-exhausted. A coalition can therefore be permitted to declassify *some* bounded
-volume, with every instance individually accountable.
+authorization and emits a signed receipt binding the canonical digest of the
+exact released payload, destination sink, labels crossed, authorizing principal,
+trusted-derived quantity, and corresponding budget consumption. The receipt
+stores the canonical payload digest; it may carry the payload itself only when
+the evidence store and every evidence recipient are cleared at the payload's
+pre-declassification confidentiality label. Release rejects if the payload,
+sink, or quantity differs from those committed by the receipt, or if the
+declassification budget is exhausted. A coalition can therefore be
+permitted to declassify *some* bounded volume, with every instance individually
+accountable.
 
 **[OPEN]** Resource identity across heterogeneous tools. "The same bank account"
 reached through two different tools must resolve to one `ResourceScope` or the
@@ -385,6 +413,14 @@ authenticated registry proofs, and applicable policy inputs and epochs. An
 offline verifier fails closed if any required opening is absent or cannot be
 validated without consulting the live runtime.
 
+The evidence must also bind the authorization decision to an authenticated
+freshness basis at its actual commit point, such as a signed checkpoint plus
+trusted time or another independently verifiable current-state commitment. An
+old but internally valid snapshot, or a receipt merely claiming an earlier
+timestamp, cannot establish that lease, policy, and revocation state were current
+when authorization was consumed. Without such freshness evidence the verifier
+must limit its verdict and must not claim the execution was currently authorized.
+
 Authorization-chain verification and execution-outcome verification are
 distinct. The `ExecutionReceipt` must carry Nexus-authenticated outcome evidence
 or another independently authenticated executor attestation or witness bound to
@@ -419,7 +455,7 @@ structure by itself does not prove that nothing was omitted.
 an `ActionEvidenceChain` covering authority, identity, delegation, canonical
 action, and the execution result. It deliberately stops there. The transactional
 receipts for *external* effects — commit-decision, effect-release, effect-outcome,
-and compensation — belong to staged external effects (§10 / roadmap R10) and only
+and compensation — belong to staged external effects (roadmap R10) and only
 then extend this into a full `EffectCertificate` chain. R3 must not claim
 external-effect semantics it does not yet implement.
 

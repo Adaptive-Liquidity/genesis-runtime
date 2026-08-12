@@ -72,7 +72,8 @@ revocation, immutable renewal; revalidation of every generation, signature,
 context, and atomic manifest snapshot immediately before token issuance; final
 validation, token issuance, and single-use consumption under one guard as the
 commit section; fresh Nexus hypervisor per execution; `MAX_AUTHORITY_CHAIN_DEPTH`
-of 32 inclusive, rejected before insertion; duplicate-manifest rejection at
+of 32 inclusive, with the root counted as depth one and the bound enforced on
+both lease and identity walks before insertion; duplicate-manifest rejection at
 canonicalization; fallible authority events; poisoned-ledger and deterministic
 race coverage including a blocked revoke at the consumed-under-read-lock cutpoint.
 The accepted post-merge hardening additionally bounds untrusted `AgentSpec`
@@ -113,22 +114,44 @@ verifiability without durability is a demo.
 **Acceptance evidence:**
 
 1. Crash-safe atomic persistence of authority state, authorization records, and
-   the event chain, with recovery provenance.
+   the event chain, with recovery provenance. Nexus entry requires the
+   authorization's consumed state and required pre-entry evidence to be durably
+   committed. That atomic durable transaction is authoritative: if it commits,
+   recovery reconstructs the authorization as consumed; if no commit record
+   exists, recovery may reconstruct it as unconsumed only because Nexus entry was
+   gated on the missing commit and therefore could not have occurred. Recovery
+   accepts either a complete committed transaction or its complete absence; a
+   torn or indeterminate record blocks recovery fail closed rather than being
+   interpreted as a successful execution.
 2. Recovery non-expansion and committed-reduction preservation: recovery
    reconstructs the exact last durably committed lifecycle state; a revoked,
-   paused, expired, or renewal-retired lease cannot reappear active, and
-   reconstructed authority remains bounded by the pre-crash ceiling. Tested by
+   paused, expired, or renewal-retired lease cannot reappear active; a consumed
+   authorization cannot reappear consumable; and reconstructed authority remains
+   bounded by the pre-crash ceiling. Tested by
    fault injection at every persistent authority, authorization, and evidence
    transition and its state/evidence boundaries, including issuance/delegation,
    renewal, pause/resume, revocation and cascading revocation, expiry,
    authorization issuance/consumption, and execution commit cutpoints; not by
    inspection.
+   A control-plane reduction — revocation, cascading revocation, pause, or renewal
+   retirement — takes effect in live authority state at its existing guard
+   linearization point and fails closed for every subsequent authorization commit
+   from that instant. Its durable commit must precede acknowledgment to the
+   requester and determines its recovery-visible state. Expiry is recomputed from
+   signed time bounds during recovery and cannot be extended by a crash. Fault
+   injection must cover guard-linearization, durable-commit, and acknowledgment
+   ordering as well as reconstruction of already committed reductions.
 3. An offline-verifiable `ActionEvidenceChain` through `ExecutionReceipt`,
    binding mission, identity, lease/delegation, canonical action, authorization,
    tool/Nexus identity, and execution outcome. The outcome requires
    Nexus-authenticated evidence or another independently authenticated executor
    attestation or witness; without it, the verifier fails closed rather than
-   claiming that execution occurred or that the reported outcome is true.
+   claiming that execution occurred or that the reported outcome is true. The
+   chain must bind the authorization decision to an authenticated freshness basis
+   at its actual commit point, such as a signed checkpoint plus trusted time or
+   another independently verifiable current-state commitment. An old valid
+   snapshot or self-asserted timestamp is insufficient to prove that lease,
+   policy, and revocation state were current.
 4. A target standalone API such as
    `verify_action_evidence_chain(chain, trust_roots) -> Verdict`, linking against
    no live runtime state. If the verdict requires the runtime that produced the
@@ -213,11 +236,19 @@ check and its corresponding reservation or consumption share one atomic admissio
 linearization point, with concurrent boundary tests proving no mission-level
 oversubscription; fail-closed `CircuitOpen` preserving evidence state; concurrent
 revocation under real parallelism, not simulated interleaving.
+Reversible admission reservations such as concurrency, active-agent, or spawn
+slots are released when an attempt fails closed before Nexus entry; irreversible
+consumptions such as single-use authorization and committed budget debits are
+not. Deterministic tests must prove repeated pre-Nexus evidence failures do not
+monotonically exhaust reversible mission concurrency.
 `EmergencyInterrupt` is carried forward from the old R10 explicitly: once an
 emergency stop is durably committed, no new authority consumption, task
 scheduling, or external-effect release proceeds — without falsely promising
 cancellation of a Nexus call already past the commit point
 ([Architecture §4](ARCHITECTURE.md#4-the-authorization-commit-section)). The
+committed interrupt survives crash and recovery and remains monotonic until an
+explicitly authorized clear transition; recovery tests must prove that it cannot
+reappear inactive. The
 protected authorization commit is the linearization point: later revocation
 cannot retroactively invalidate the committed authorization consumption;
 fail-closed failures after commit may still prevent Nexus entry; once Nexus
@@ -275,10 +306,19 @@ canonical resource identity across heterogeneous tools.
 1. `ResourceBudgetLedger` with consumption scoped to `ResourceScope`; a trusted
    tool-specific canonicalizer derives both scope and quantity from the authorized
    canonical action and bound tool identity, and binds that budget effect through
-   execution. Consumption is enforced inside the existing commit section and
-   reuses the protected authorization-commit linearization point. R8 must
+   execution. Consumption is admitted inside the existing commit section so it
+   inherits protected freshness and revoke-vs-commit ordering. After final
+   revalidation and token issuance succeed, the shared-ledger read-check-debit,
+   single-use authorization consumption, and required R3 pre-entry evidence
+   commit as one atomic durable transaction: either all commit or none do. This
+   combined transaction supplies the authorization/resource-consumption
+   linearization point because the authority read guard does not serialize
+   concurrent commits. Recovery reconstructs consumed totals monotonically, and
+   an authorization reconstructed as unconsumed has no committed debit. R8 must
    independently establish shared-ledger atomicity, budget conservation, and
-   authority/budget interaction.
+   authority/budget interaction. Once the transaction commits, a later
+   fail-closed pre-Nexus failure leaves the authorization and budget quantity
+   consumed; no compensating release or rollback is permitted.
 2. The canonical test: two agents, each individually authorized to move `x`,
    jointly refused at `2x` when the resource budget is `x`. Every per-agent check
    passes; the aggregate is refused.
@@ -292,7 +332,10 @@ canonical resource identity across heterogeneous tools.
 ## R9 — IFC/MAC labels, AEON-IQ memory integration, and gated declassification
 
 The informational half. Confidentiality × integrity labels on runtime objects;
-labels carried across handoffs; sinks check labels.
+labels carried across handoffs; sinks check labels. A hosted model or model
+provider is itself a sink and principal: prompt/context assembly must enforce its
+clearance before confidential content is disclosed, rather than relying only on
+checks applied to later tool or network outputs.
 
 Labels must also propagate through agent computation, not only direct object
 handoffs. R9 must select and specify an enforceable propagation mechanism, such
@@ -302,9 +345,13 @@ read confidential data, derive a fresh outbound action, and prove that a lower-
 label sink rejects it unless an authorized declassification is consumed.
 
 **The novel part is declassification**, not the lattice: declassification
-consumes a budgeted authorization and emits a signed receipt naming labels
-crossed and authorizing principal. A trusted escape hatch becomes an accountable,
-bounded, evidenced operation.
+consumes a budgeted authorization and emits a signed receipt binding the exact
+released payload's canonical digest, destination sink, labels crossed,
+authorizing principal, trusted-derived quantity, and corresponding budget
+consumption. The raw payload may appear in evidence only when the evidence store
+and every evidence recipient are cleared at its pre-declassification
+confidentiality label. Release rejects payload, sink, or quantity substitution.
+A trusted escape hatch becomes an accountable, bounded, evidenced operation.
 
 **AEON-IQ memory integration** lands here rather than vanishing from the roadmap.
 Memory is advisory by design and must never directly mutate mission, authority,
