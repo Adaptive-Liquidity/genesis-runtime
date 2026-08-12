@@ -5,11 +5,15 @@
 This document describes the standalone `genesis-runtime` workspace. It separates
 three things that are easy to conflate, and the separation is load-bearing:
 
+<!-- markdownlint-disable MD013 -->
+
 | Marker | Meaning |
 | --- | --- |
 | **[R0–R2]** | Implemented and tested in this workspace. Evidence exists and is named. |
 | **[TARGET]** | Designed here, not implemented. No security property may be inferred from it. |
 | **[OPEN]** | Known gap with no design committed. Recorded so its absence is visible. |
+
+<!-- markdownlint-enable MD013 -->
 
 The normative baseline is [AEON Protocol v1.4](AEON_PROTOCOL_V1_4.md), preserved
 byte-for-byte. This document is explanatory and does not amend it. Where the
@@ -144,14 +148,19 @@ the call and snapshot identifiers are not reusable across calls. **[R0–R2]**
 
 - A revocation linearizing **before** the section: execution refused, no token
   issued.
-- A revocation linearizing **after** the section: execution proceeds to
-  completion; the revocation governs all subsequent calls.
+- A revocation linearizing **after** the section but before Nexus entry does not
+  invalidate the consumed authorization, and it governs all subsequent calls.
+  Fail-closed `AuthorizationConsumed` or `ExecutionStarted` evidence-append
+  failures may still prevent Nexus entry.
+- Once Nexus execution begins, a later revocation does not cancel that in-flight
+  execution and governs all subsequent calls.
 
-The second clause is a negative result and is deliberately not softened into
-"eventual" revocation. Holding the guard across WASM execution would make
-revocation cancel in-flight work, at the cost of serializing every execution in a
-mission behind the slowest tool call and making one hung tool a mission-wide
-denial of service. The shorter region is chosen and the consequence is stated.
+The post-commit guarantees are negative results and are deliberately not
+softened into "eventual" revocation. Holding the guard across WASM execution
+would make revocation cancel in-flight work, at the cost of serializing every
+execution in a mission behind the slowest tool call and making one hung tool a
+mission-wide denial of service. The shorter region is chosen and the consequence
+is stated.
 
 After the protected commit, `AuthorizationConsumed` evidence is appended before
 `ExecutionStarted` and before Nexus entry. If the consumption-evidence append
@@ -180,6 +189,8 @@ the monitor itself even when every link attenuates correctly. **[R0–R2]**
 
 ## 5. Data ownership
 
+<!-- markdownlint-disable MD013 -->
+
 | Data | Owner | Status |
 | --- | --- | --- |
 | `AgentSpec` | Untrusted proposal | Typed request; signing credentials host-side **[R0–R2]** |
@@ -196,6 +207,8 @@ the monitor itself even when every link attenuates correctly. **[R0–R2]**
 | `ResourceBudgetLedger` | Trusted authorization path | **[TARGET]** — §7 |
 | `ActionEvidenceChain` through `ExecutionReceipt` | Evidence plane | **[TARGET]** — R3 / §8 |
 | Full transactional `EffectCertificate` chain | Evidence plane | **[TARGET]** — R10 |
+
+<!-- markdownlint-enable MD013 -->
 
 ---
 
@@ -216,6 +229,8 @@ authorization. Generalize it.
 `compatible_for(Σ, Σ′, A)` — context `Σ′` is a safe continuation of `Σ` for
 authorization class `A`. Proposed relation classes, weakest to strongest:
 
+<!-- markdownlint-disable MD013 -->
+
 | Class | Rule | Safe for |
 | --- | --- | --- |
 | `Identical` | `H(Σ) = H(Σ′)` | everything (today's behavior) |
@@ -224,6 +239,8 @@ authorization class `A`. Proposed relation classes, weakest to strongest:
 | `CertifiedModelEquivalence` | model substituted within an equivalence class signed by a trusted equivalence authority | any `A` whose effect class tolerates it |
 | `InstructionRefinement` | instruction change proved strictly narrowing | any `A` |
 | `Incompatible` | otherwise | nothing — re-authorize |
+
+<!-- markdownlint-enable MD013 -->
 
 Compatibility is **not** transitively assumed: `Σ→Σ′` and `Σ′→Σ″` compatible does
 not imply `Σ→Σ″`. Each transition is evaluated against the originally bound
@@ -290,16 +307,17 @@ research position.
 `AuthorizationRecord` enforces single-use consumption per `ActionRef`. Extend the
 ledger with budgets scoped to the mission's `ResourceScope`:
 
-```
+```text
 consume(action_ref, resource_scope, quantity)
   -> Ok  if  Σ consumed(resource_scope) + quantity ≤ budget(resource_scope)
   -> Err otherwise
 ```
 
-Consumption happens **inside the existing commit section**, so the aggregate
-check inherits the linearization already proved for revocation. No new
-concurrency reasoning is required — this is why the mechanism is cheap for this
-system and expensive for anyone else.
+Consumption reuses **the existing commit section** as its linearization point,
+reducing the new concurrency surface. R8 must still establish shared-ledger
+atomicity, canonical `ResourceScope` identity across heterogeneous tools, budget
+conservation, authority/budget interaction, no double-spend under R6
+parallelism, and adversarial concurrent behavior.
 
 **Gated declassification.** Declassification is normally a trusted-code escape
 hatch. Here it becomes a first-class authorized effect: it consumes a budgeted
@@ -338,7 +356,7 @@ preparation context, not a compliance claim or hard deadline for this roadmap.
 **The design.** Every authorized execution produces an evidence chain verifiable
 offline:
 
-```
+```text
 MissionEnvelope (principal-signed)
   └─> AgentIdentityCertificate (issuer-signed)
       └─> AuthorityLeaseCertificate (parent-signed, transitively attenuated)
@@ -370,9 +388,9 @@ checkpoints. Global omission or split-view resistance additionally requires
 monitoring, witnesses, checkpoint gossip, or external commitments. A Merkle
 structure by itself does not prove that nothing was omitted.
 
-**Stage boundary.** What R3 delivers is this chain through `ExecutionReceipt` — an
-`ActionEvidenceChain` covering authority, identity, delegation, canonical action,
-and the execution result. It deliberately stops there. The transactional
+**Stage boundary.** What R3 delivers is this chain through `ExecutionReceipt` —
+an `ActionEvidenceChain` covering authority, identity, delegation, canonical
+action, and the execution result. It deliberately stops there. The transactional
 receipts for *external* effects — commit-decision, effect-release, effect-outcome,
 and compensation — belong to staged external effects (§10 / roadmap R10) and only
 then extend this into a full `EffectCertificate` chain. R3 must not claim
