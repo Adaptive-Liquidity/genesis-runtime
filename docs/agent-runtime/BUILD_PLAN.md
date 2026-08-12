@@ -114,12 +114,15 @@ verifiability without durability is a demo.
 
 1. Crash-safe atomic persistence of authority state, authorization records, and
    the event chain, with recovery provenance.
-2. Recovery non-expansion: authority reconstructed after crash is bounded by the
-   pre-crash ceiling. Tested by fault injection at every persistent authority,
-   authorization, and evidence transition and its state/evidence boundaries,
-   including issuance/delegation, renewal, pause/resume, revocation and cascading
-   revocation, expiry, authorization issuance/consumption, and execution commit
-   cutpoints; not by inspection.
+2. Recovery non-expansion and committed-reduction preservation: recovery
+   reconstructs the exact last durably committed lifecycle state; a revoked,
+   paused, expired, or renewal-retired lease cannot reappear active, and
+   reconstructed authority remains bounded by the pre-crash ceiling. Tested by
+   fault injection at every persistent authority, authorization, and evidence
+   transition and its state/evidence boundaries, including issuance/delegation,
+   renewal, pause/resume, revocation and cascading revocation, expiry,
+   authorization issuance/consumption, and execution commit cutpoints; not by
+   inspection.
 3. An offline-verifiable `ActionEvidenceChain` through `ExecutionReceipt`,
    binding mission, identity, lease/delegation, canonical action, authorization,
    tool/Nexus identity, and execution outcome.
