@@ -311,10 +311,19 @@ research position.
 ledger with budgets scoped to the mission's `ResourceScope`:
 
 ```text
-consume(action_ref, resource_scope, quantity)
-  -> Ok  if  Σ consumed(resource_scope) + quantity ≤ budget(resource_scope)
+budget_effect = trusted_budget_canonicalizer(canonical_action, bound_tool_binding)
+consume(action_ref, budget_effect)
+  -> Ok  if  Σ consumed(budget_effect.resource_scope) + budget_effect.quantity
+               ≤ budget(budget_effect.resource_scope)
   -> Err otherwise
 ```
+
+Neither `ResourceScope` nor quantity is accepted from the model as an independent
+accounting input. A trusted tool-specific canonicalizer derives both from the
+authorized canonical action and its bound tool identity, and execution is bound
+to that derived effect. Any action/effect mismatch rejects. Cross-tool tests must
+prove that semantically identical quantities against the same resource produce
+the same budget effect.
 
 Consumption reuses **the existing commit section** as its linearization point,
 reducing the new concurrency surface. R8 must still establish shared-ledger
@@ -375,6 +384,14 @@ manifest and relevant tool bindings, semantic context, registry snapshot or
 authenticated registry proofs, and applicable policy inputs and epochs. An
 offline verifier fails closed if any required opening is absent or cannot be
 validated without consulting the live runtime.
+
+Authorization-chain verification and execution-outcome verification are
+distinct. The `ExecutionReceipt` must carry Nexus-authenticated outcome evidence
+or another independently authenticated executor attestation or witness bound to
+the action, tool identity, and Nexus revision. Until such a mechanism is selected
+and present, the verifier must limit its verdict to authorization and artifact
+consistency and must not claim that execution occurred or that the reported
+outcome is true.
 
 The target API is a standalone
 `verify_action_evidence_chain(chain, trust_roots) -> Verdict` that links against

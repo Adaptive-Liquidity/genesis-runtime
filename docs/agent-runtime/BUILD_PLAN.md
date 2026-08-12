@@ -125,7 +125,10 @@ verifiability without durability is a demo.
    inspection.
 3. An offline-verifiable `ActionEvidenceChain` through `ExecutionReceipt`,
    binding mission, identity, lease/delegation, canonical action, authorization,
-   tool/Nexus identity, and execution outcome.
+   tool/Nexus identity, and execution outcome. The outcome requires
+   Nexus-authenticated evidence or another independently authenticated executor
+   attestation or witness; without it, the verifier fails closed rather than
+   claiming that execution occurred or that the reported outcome is true.
 4. A target standalone API such as
    `verify_action_evidence_chain(chain, trust_roots) -> Verdict`, linking against
    no live runtime state. If the verdict requires the runtime that produced the
@@ -252,10 +255,13 @@ canonical resource identity across heterogeneous tools.
 
 **Acceptance evidence:**
 
-1. `ResourceBudgetLedger` with consumption scoped to `ResourceScope`, enforced
-   inside the existing commit section and reusing the protected
-   authorization-commit linearization point. R8 must independently establish
-   shared-ledger atomicity, budget conservation, and authority/budget interaction.
+1. `ResourceBudgetLedger` with consumption scoped to `ResourceScope`; a trusted
+   tool-specific canonicalizer derives both scope and quantity from the authorized
+   canonical action and bound tool identity, and binds that budget effect through
+   execution. Consumption is enforced inside the existing commit section and
+   reuses the protected authorization-commit linearization point. R8 must
+   independently establish shared-ledger atomicity, budget conservation, and
+   authority/budget interaction.
 2. The canonical test: two agents, each individually authorized to move `x`,
    jointly refused at `2x` when the resource budget is `x`. Every per-agent check
    passes; the aggregate is refused.
