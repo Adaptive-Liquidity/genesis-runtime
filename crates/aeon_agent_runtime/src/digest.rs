@@ -162,6 +162,12 @@ pub fn canonical_bytes<T>(domain: &str, value: &T) -> Result<Vec<u8>>
 where
     T: Serialize + ?Sized,
 {
+    if domain.is_empty() {
+        return Err(RuntimeError::new(
+            ErrorCode::InvalidInput,
+            "digest domain must contain at least one byte",
+        ));
+    }
     let value = serde_json::to_value(value).map_err(canonical_error)?;
     let canonical = canonicalize_json(value);
     let encoded = serde_json::to_vec(&canonical).map_err(canonical_error)?;
@@ -199,5 +205,19 @@ fn canonicalize_json(value: Value) -> Value {
             Value::Object(sorted)
         }
         primitive => primitive,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::canonical_bytes;
+    use crate::error::ErrorCode;
+
+    #[test]
+    fn canonical_bytes_rejects_an_empty_domain() {
+        let error = canonical_bytes("", &json!({})).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidInput);
     }
 }

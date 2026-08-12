@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use aeon_agent_runtime::{
-    canonical_digest, AuthorityEventKind, AuthorityKernel, AuthoritySet, BoundTool,
+    canonical_digest, AuthorityEvent, AuthorityEventKind, AuthorityKernel, AuthoritySet, BoundTool,
     CapabilityManifest, DelegationRequest, Digest, ErrorCode, InMemoryKeyCustody, KeyCustody,
-    KeyId, LeaseState, MissionEnvelope, MissionId, PermissionSet, RenewalRequest, RootLeaseRequest,
-    ToolId, MAX_AUTHORITY_CHAIN_DEPTH,
+    KeyId, LeaseId, LeaseSnapshot, LeaseState, MissionEnvelope, MissionId, PermissionSet,
+    RenewalRequest, RootLeaseRequest, ToolId, MAX_AUTHORITY_CHAIN_DEPTH,
 };
 use chrono::{Duration, TimeZone, Utc};
 use nexus::Capability;
@@ -15,6 +15,10 @@ fn digest(label: &str) -> Digest {
 
 fn tool_id(value: &str) -> ToolId {
     ToolId::new(value).unwrap()
+}
+
+fn authority_set(capabilities: Vec<Capability>) -> AuthoritySet {
+    AuthoritySet::new(capabilities).unwrap()
 }
 
 fn manifest(capabilities: Vec<Capability>, tools: Vec<(&str, &str)>) -> CapabilityManifest {
@@ -73,10 +77,8 @@ fn fixture() -> Fixture {
         RootLeaseRequest {
             mission: mission(now),
             agent_id: aeon_agent_runtime::AgentId::new("agent-root").unwrap(),
-            granted_authority: AuthoritySet {
-                capabilities: capabilities.clone(),
-            },
-            delegable_authority: AuthoritySet { capabilities },
+            granted_authority: authority_set(capabilities.clone()),
+            delegable_authority: authority_set(capabilities),
             capability_manifest: root_manifest.clone(),
             semantic_context_digest: digest("root-context"),
             expires_at: now + Duration::minutes(45),
@@ -109,12 +111,8 @@ fn delegate_child(
                 parent_lease_id,
                 expected_parent_generation: parent_generation,
                 child_agent_id: aeon_agent_runtime::AgentId::new(child_agent).unwrap(),
-                granted_authority: AuthoritySet {
-                    capabilities: vec![capability.clone()],
-                },
-                delegable_authority: AuthoritySet {
-                    capabilities: vec![capability.clone()],
-                },
+                granted_authority: authority_set(vec![capability.clone()]),
+                delegable_authority: authority_set(vec![capability.clone()]),
                 capability_manifest: manifest(vec![capability], vec![tool]),
                 semantic_context_digest: digest(&format!("{child_agent}-context")),
                 expires_at: fixture.now + Duration::minutes(30),
@@ -133,9 +131,7 @@ fn cryptographic_agent_identity_is_issuer_bound_and_key_custody_is_redacted() {
         .kernel
         .identity_certificate(&aeon_agent_runtime::AgentId::new("agent-root").unwrap())
         .unwrap();
-    root_identity
-        .verify_signature(&fixture.root_key.verifying_key())
-        .unwrap();
+    root_identity.verify_self_signed().unwrap();
     assert_eq!(root_identity.key_id, fixture.root_key.key_id());
     assert_eq!(
         fixture
@@ -206,12 +202,8 @@ fn delegation_rejects_capability_tool_expiry_and_all_expansion() {
             uuid::Uuid::new_v4()
         ))
         .unwrap(),
-        granted_authority: AuthoritySet {
-            capabilities: vec![capability.clone()],
-        },
-        delegable_authority: AuthoritySet {
-            capabilities: vec![capability.clone()],
-        },
+        granted_authority: authority_set(vec![capability.clone()]),
+        delegable_authority: authority_set(vec![capability.clone()]),
         capability_manifest: manifest(vec![capability], vec![tool]),
         semantic_context_digest: digest("child-context"),
         expires_at,
@@ -233,17 +225,15 @@ fn delegation_rejects_capability_tool_expiry_and_all_expansion() {
             ("fixture.read", "read-v1"),
             fixture.now + Duration::minutes(50),
         ),
-        request(
-            Capability::All,
-            ("fixture.read", "read-v1"),
-            fixture.now + Duration::minutes(20),
-        ),
     ] {
         assert!(fixture
             .kernel
             .delegate(invalid, child_key(), fixture.now)
             .is_err());
     }
+
+    let error = AuthoritySet::new(vec![Capability::All]).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::CapabilityAllForbidden);
 }
 
 #[test]
@@ -387,7 +377,7 @@ fn renewal_creates_a_new_certificate_retires_old_and_invalidates_children() {
 }
 
 #[test]
-fn renewal_cannot_resurrect_or_expand_authority() {
+fn renewal_cannot_resurrect_revoked_authority() {
     let fixture = fixture();
     let root = fixture.kernel.root_lease_id().unwrap();
     let original = fixture.kernel.lease_snapshot(&root).unwrap();
@@ -401,9 +391,7 @@ fn renewal_cannot_resurrect_or_expand_authority() {
             RenewalRequest {
                 lease_id: root,
                 expected_generation: 1,
-                granted_authority: AuthoritySet {
-                    capabilities: vec![Capability::All],
-                },
+                granted_authority: original.certificate.granted_authority.clone(),
                 delegable_authority: original.certificate.delegable_authority,
                 capability_manifest: fixture.root_manifest,
                 semantic_context_digest: original.certificate.semantic_context_digest,
@@ -412,10 +400,7 @@ fn renewal_cannot_resurrect_or_expand_authority() {
             fixture.now + Duration::minutes(5),
         )
         .unwrap_err();
-    assert!(matches!(
-        error.code(),
-        ErrorCode::LeaseInactive | ErrorCode::CapabilityAllForbidden
-    ));
+    assert_eq!(error.code(), ErrorCode::LeaseInactive);
 }
 
 #[test]
@@ -451,6 +436,7 @@ fn renewal_rejects_semantic_context_drift_without_mutating_authority_state() {
 fn delegation_enforces_the_public_maximum_authority_chain_depth_without_mutation() {
     let fixture = fixture();
     let mut parent = fixture.kernel.root_lease_id().unwrap();
+    let mut chain_ids = vec![parent.clone()];
 
     for depth in 2..=MAX_AUTHORITY_CHAIN_DEPTH {
         parent = delegate_child(
@@ -465,6 +451,7 @@ fn delegation_enforces_the_public_maximum_authority_chain_depth_without_mutation
             Capability::ReadFile("/data/reports".into()),
             ("fixture.read", "read-v1"),
         );
+        chain_ids.push(parent.clone());
     }
 
     let leaf_manifest = manifest(
@@ -476,8 +463,7 @@ fn delegation_enforces_the_public_maximum_authority_chain_depth_without_mutation
         .validate_active_chain(&parent, Some(0), &leaf_manifest, fixture.now)
         .unwrap();
     assert_eq!(validated.chain.len(), MAX_AUTHORITY_CHAIN_DEPTH);
-    let events_before = fixture.kernel.events().unwrap();
-    let state_counts_before = format!("{:?}", fixture.kernel);
+    let snapshot_before = AuthorityStateSnapshot::capture(&fixture.kernel, &chain_ids);
     let rejected_agent = aeon_agent_runtime::AgentId::new("agent-too-deep").unwrap();
 
     let error = fixture
@@ -487,12 +473,12 @@ fn delegation_enforces_the_public_maximum_authority_chain_depth_without_mutation
                 parent_lease_id: parent,
                 expected_parent_generation: 0,
                 child_agent_id: rejected_agent.clone(),
-                granted_authority: AuthoritySet {
-                    capabilities: vec![Capability::ReadFile("/data/reports".into())],
-                },
-                delegable_authority: AuthoritySet {
-                    capabilities: vec![Capability::ReadFile("/data/reports".into())],
-                },
+                granted_authority: authority_set(vec![Capability::ReadFile(
+                    "/data/reports".into(),
+                )]),
+                delegable_authority: authority_set(vec![Capability::ReadFile(
+                    "/data/reports".into(),
+                )]),
                 capability_manifest: leaf_manifest,
                 semantic_context_digest: digest("too-deep-context"),
                 expires_at: fixture.now + Duration::minutes(30),
@@ -503,12 +489,140 @@ fn delegation_enforces_the_public_maximum_authority_chain_depth_without_mutation
         .unwrap_err();
 
     assert_eq!(error.code(), ErrorCode::DelegationInvalid);
-    assert_eq!(fixture.kernel.events().unwrap(), events_before);
+    assert_eq!(
+        AuthorityStateSnapshot::capture(&fixture.kernel, &chain_ids),
+        snapshot_before
+    );
     assert!(fixture
         .kernel
         .identity_certificate(&rejected_agent)
         .is_err());
-    assert_eq!(format!("{:?}", fixture.kernel), state_counts_before);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AuthorityStateSnapshot {
+    root_lease_id: LeaseId,
+    leases: Vec<(LeaseId, LeaseSnapshot)>,
+    events: Vec<AuthorityEvent>,
+}
+
+impl AuthorityStateSnapshot {
+    fn capture(kernel: &AuthorityKernel, lease_ids: &[LeaseId]) -> Self {
+        Self {
+            root_lease_id: kernel.root_lease_id().unwrap(),
+            leases: lease_ids
+                .iter()
+                .map(|lease_id| (lease_id.clone(), kernel.lease_snapshot(lease_id).unwrap()))
+                .collect(),
+            events: kernel.events().unwrap(),
+        }
+    }
+}
+
+#[test]
+fn revocation_returns_root_first_breadth_first_sorted_lease_ids() {
+    let fixture = fixture();
+    let root = fixture.kernel.root_lease_id().unwrap();
+    let child_a = delegate_child(
+        &fixture,
+        root.clone(),
+        0,
+        "agent-child-a",
+        Arc::new(InMemoryKeyCustody::generate(KeyId::new("key-child-a").unwrap()).unwrap()),
+        Capability::ReadFile("/data/reports/a".into()),
+        ("fixture.read", "read-v1"),
+    );
+    let child_b = delegate_child(
+        &fixture,
+        root.clone(),
+        0,
+        "agent-child-b",
+        Arc::new(InMemoryKeyCustody::generate(KeyId::new("key-child-b").unwrap()).unwrap()),
+        Capability::ReadFile("/data/reports/b".into()),
+        ("fixture.read", "read-v1"),
+    );
+    let grandchild_a = delegate_child(
+        &fixture,
+        child_a.clone(),
+        0,
+        "agent-grandchild-a",
+        Arc::new(InMemoryKeyCustody::generate(KeyId::new("key-grandchild-a").unwrap()).unwrap()),
+        Capability::ReadFile("/data/reports/a/final".into()),
+        ("fixture.read", "read-v1"),
+    );
+    let grandchild_b = delegate_child(
+        &fixture,
+        child_b.clone(),
+        0,
+        "agent-grandchild-b",
+        Arc::new(InMemoryKeyCustody::generate(KeyId::new("key-grandchild-b").unwrap()).unwrap()),
+        Capability::ReadFile("/data/reports/b/final".into()),
+        ("fixture.read", "read-v1"),
+    );
+    let mut branches = [(child_a, grandchild_a), (child_b, grandchild_b)];
+    branches.sort_by(|left, right| left.0.cmp(&right.0));
+    let expected = std::iter::once(root.clone())
+        .chain(branches.iter().map(|(child, _)| child.clone()))
+        .chain(branches.iter().map(|(_, grandchild)| grandchild.clone()))
+        .collect::<Vec<_>>();
+
+    let affected = fixture
+        .kernel
+        .revoke(&root, 0, "deterministic cascade", fixture.now)
+        .unwrap();
+
+    assert_eq!(affected, expected);
+    let event_ids = fixture
+        .kernel
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == AuthorityEventKind::LeaseRevoked)
+        .map(|event| event.lease_id)
+        .collect::<Vec<_>>();
+    assert_eq!(event_ids, expected);
+}
+
+#[test]
+fn expiration_candidates_and_events_are_sorted_by_lease_id() {
+    let fixture = fixture();
+    let root = fixture.kernel.root_lease_id().unwrap();
+    let child_a = delegate_child(
+        &fixture,
+        root.clone(),
+        0,
+        "agent-expiring-a",
+        Arc::new(InMemoryKeyCustody::generate(KeyId::new("key-expiring-a").unwrap()).unwrap()),
+        Capability::ReadFile("/data/reports/a".into()),
+        ("fixture.read", "read-v1"),
+    );
+    let child_b = delegate_child(
+        &fixture,
+        root,
+        0,
+        "agent-expiring-b",
+        Arc::new(InMemoryKeyCustody::generate(KeyId::new("key-expiring-b").unwrap()).unwrap()),
+        Capability::ReadFile("/data/reports/b".into()),
+        ("fixture.read", "read-v1"),
+    );
+    let mut expected = vec![child_a, child_b];
+    expected.sort();
+
+    let expired = fixture
+        .kernel
+        .refresh_expirations(fixture.now + Duration::minutes(31))
+        .unwrap();
+
+    assert_eq!(expired, expected);
+    let event_ids = fixture
+        .kernel
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == AuthorityEventKind::LeaseExpired)
+        .map(|event| event.lease_id)
+        .collect::<Vec<_>>();
+    assert_eq!(event_ids, expected);
 }
 
 #[test]

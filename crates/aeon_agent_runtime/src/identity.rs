@@ -109,15 +109,25 @@ impl AgentIdentityCertificate {
             issued_at: &'a DateTime<Utc>,
         }
 
+        let AgentIdentityCertificate {
+            agent_id,
+            key_id,
+            verifying_key_bytes,
+            issuer_agent_id,
+            issuer_key_id,
+            issued_at,
+            signature: _,
+        } = self;
+
         canonical_bytes(
             "aeon-agent-identity-certificate-v1",
             &SigningPayload {
-                agent_id: &self.agent_id,
-                key_id: &self.key_id,
-                verifying_key_bytes: &self.verifying_key_bytes,
-                issuer_agent_id: &self.issuer_agent_id,
-                issuer_key_id: &self.issuer_key_id,
-                issued_at: &self.issued_at,
+                agent_id,
+                key_id,
+                verifying_key_bytes,
+                issuer_agent_id,
+                issuer_key_id,
+                issued_at,
             },
         )
     }
@@ -135,14 +145,38 @@ impl AgentIdentityCertificate {
         })
     }
 
-    pub fn verify_signature(&self, issuer_verifying_key: &VerifyingKey) -> Result<()> {
-        self.verifying_key()?;
-        if self.issuer_agent_id.is_none() && self.issuer_key_id != self.key_id {
+    /// Verifies that this certificate is bound to the supplied issuer certificate.
+    ///
+    /// This checks identifiers, public keys, and the signature only. It does not
+    /// establish that the issuer is trusted or that its certificate is valid.
+    pub fn verify_issued_by(&self, issuer: &Self) -> Result<()> {
+        if self.issuer_agent_id.as_ref() != Some(&issuer.agent_id)
+            || self.issuer_key_id != issuer.key_id
+        {
             return Err(RuntimeError::new(
                 ErrorCode::IdentityInvalid,
-                "a self-signed root identity must use its own key as issuer",
+                "identity certificate issuer binding is invalid",
             ));
         }
+        self.verify_signature(&issuer.verifying_key()?)
+    }
+
+    /// Verifies the certificate's self-signature and self-issuer binding.
+    ///
+    /// A valid self-signature is not a trust decision. Callers must separately
+    /// decide whether this identity is an accepted trust anchor.
+    pub fn verify_self_signed(&self) -> Result<()> {
+        if self.issuer_agent_id.is_some() || self.issuer_key_id != self.key_id {
+            return Err(RuntimeError::new(
+                ErrorCode::IdentityInvalid,
+                "self-signed identity certificate issuer binding is invalid",
+            ));
+        }
+        self.verify_signature(&self.verifying_key()?)
+    }
+
+    pub(crate) fn verify_signature(&self, issuer_verifying_key: &VerifyingKey) -> Result<()> {
+        self.verifying_key()?;
         let signature_bytes = <[u8; 64]>::try_from(self.signature.as_bytes()).map_err(|_| {
             RuntimeError::new(
                 ErrorCode::IdentityInvalid,

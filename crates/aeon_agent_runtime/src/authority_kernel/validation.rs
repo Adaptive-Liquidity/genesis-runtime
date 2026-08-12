@@ -8,6 +8,7 @@ pub(super) fn validate_chain(
     now: DateTime<Utc>,
 ) -> Result<ValidatedAuthority> {
     let mut visited = HashSet::new();
+    let mut successfully_validated_identities = HashSet::new();
     let mut chain_entries = Vec::new();
     let mut current_id = leaf_lease_id.clone();
     loop {
@@ -27,7 +28,7 @@ pub(super) fn validate_chain(
             .then_some(expected_leaf_generation)
             .flatten();
         validate_active_record(entry, expected, now)?;
-        validate_certificate_entry(state, entry)?;
+        validate_certificate_entry(state, entry, &mut successfully_validated_identities)?;
         chain_entries.push((current_id.clone(), entry));
         match &entry.certificate.parent_lease {
             Some(parent) => {
@@ -74,7 +75,11 @@ pub(super) fn validate_chain(
     })
 }
 
-fn validate_certificate_entry(state: &AuthorityState, entry: &LeaseEntry) -> Result<()> {
+fn validate_certificate_entry(
+    state: &AuthorityState,
+    entry: &LeaseEntry,
+    successfully_validated_identities: &mut HashSet<AgentId>,
+) -> Result<()> {
     let certificate = &entry.certificate;
     if certificate.mission_id != state.mission.mission_id
         || certificate.organization_version != state.mission.organization_version
@@ -89,7 +94,11 @@ fn validate_certificate_entry(state: &AuthorityState, entry: &LeaseEntry) -> Res
     let subject = state.identities.get(&certificate.agent_id).ok_or_else(|| {
         authority_error(ErrorCode::IdentityInvalid, "lease subject identity missing")
     })?;
-    validate_identity_chain(state, &certificate.agent_id)?;
+    validate_identity_chain(
+        state,
+        &certificate.agent_id,
+        successfully_validated_identities,
+    )?;
     if subject.canonical_digest()? != certificate.agent_identity_digest {
         return Err(authority_error(
             ErrorCode::IdentityInvalid,
@@ -134,10 +143,21 @@ fn validate_certificate_entry(state: &AuthorityState, entry: &LeaseEntry) -> Res
     Ok(())
 }
 
-fn validate_identity_chain(state: &AuthorityState, leaf_agent_id: &AgentId) -> Result<()> {
+pub(super) fn validate_identity_chain(
+    state: &AuthorityState,
+    leaf_agent_id: &AgentId,
+    successfully_validated_identities: &mut HashSet<AgentId>,
+) -> Result<()> {
+    if successfully_validated_identities.contains(leaf_agent_id) {
+        return Ok(());
+    }
     let mut current_agent_id = leaf_agent_id.clone();
     let mut visited = HashSet::new();
+    let mut validated_identity_ids = Vec::new();
     loop {
+        if successfully_validated_identities.contains(&current_agent_id) {
+            break;
+        }
         if !visited.insert(current_agent_id.clone()) {
             return Err(authority_error(
                 ErrorCode::IdentityInvalid,
@@ -164,7 +184,9 @@ fn validate_identity_chain(state: &AuthorityState, leaf_agent_id: &AgentId) -> R
                         "identity issuer key binding is invalid",
                     ));
                 }
+                record_identity_signature_verification();
                 identity.verify_signature(&issuer.verifying_key()?)?;
+                validated_identity_ids.push(current_agent_id.clone());
                 current_agent_id = issuer_agent_id.clone();
             }
             None => {
@@ -174,11 +196,35 @@ fn validate_identity_chain(state: &AuthorityState, leaf_agent_id: &AgentId) -> R
                         "root identity is not self-issued",
                     ));
                 }
+                record_identity_signature_verification();
                 identity.verify_signature(&identity.verifying_key()?)?;
-                return Ok(());
+                validated_identity_ids.push(current_agent_id);
+                break;
             }
         }
     }
+    successfully_validated_identities.extend(validated_identity_ids);
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static IDENTITY_SIGNATURE_VERIFICATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn record_identity_signature_verification() {
+    #[cfg(test)]
+    IDENTITY_SIGNATURE_VERIFICATION_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+pub(super) fn reset_identity_signature_verification_count() {
+    IDENTITY_SIGNATURE_VERIFICATION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn identity_signature_verification_count() -> usize {
+    IDENTITY_SIGNATURE_VERIFICATION_COUNT.with(std::cell::Cell::get)
 }
 
 fn validate_parent_child(parent: &LeaseEntry, child: &LeaseEntry) -> Result<()> {
@@ -230,9 +276,9 @@ pub(super) fn validate_authority_sets(
     delegable: &AuthoritySet,
 ) -> Result<()> {
     if granted
-        .capabilities
+        .capabilities()
         .iter()
-        .chain(&delegable.capabilities)
+        .chain(delegable.capabilities())
         .any(|capability| capability == &Capability::All)
     {
         return Err(authority_error(
@@ -260,7 +306,7 @@ pub(super) fn validate_manifest(
         ));
     }
     if canonical_capabilities(&manifest.permissions.capabilities)?
-        != canonical_capabilities(&authority.capabilities)?
+        != canonical_capabilities(authority.capabilities())?
     {
         return Err(authority_error(
             ErrorCode::CapabilityManifestMismatch,
@@ -286,7 +332,8 @@ pub(super) fn validate_manifest_attenuation(
     child: &CapabilityManifest,
     parent: &CapabilityManifest,
 ) -> Result<()> {
-    if child.model_manifest_digest != parent.model_manifest_digest
+    if child.version != parent.version
+        || child.model_manifest_digest != parent.model_manifest_digest
         || child.runtime_config_digest != parent.runtime_config_digest
         || child.tool_registry_root_digest != parent.tool_registry_root_digest
         || child.approved_tools.iter().any(|child_tool| {
@@ -305,7 +352,7 @@ pub(super) fn validate_manifest_attenuation(
 }
 
 pub(super) fn authority_is_subset_of(child: &AuthoritySet, parent: &AuthoritySet) -> bool {
-    authority_is_subset_of_capabilities(child, &parent.capabilities)
+    authority_is_subset_of_capabilities(child, parent.capabilities())
 }
 
 pub(super) fn authority_is_subset_of_capabilities(
@@ -313,7 +360,7 @@ pub(super) fn authority_is_subset_of_capabilities(
     parent: &[Capability],
 ) -> bool {
     child
-        .capabilities
+        .capabilities()
         .iter()
         .all(|requested| parent.iter().any(|granted| requested.is_subset_of(granted)))
 }
@@ -357,22 +404,31 @@ pub(super) fn descendants_including(
     if !state.leases.contains_key(root) {
         return Err(authority_error(ErrorCode::LeaseInactive, "lease not found"));
     }
-    let mut result = vec![root.clone()];
-    let mut index = 0;
-    while index < result.len() {
-        let parent = result[index].clone();
-        for (lease_id, entry) in &state.leases {
-            if entry
-                .certificate
-                .parent_lease
-                .as_ref()
-                .is_some_and(|reference| reference.lease_id == parent)
-                && !result.contains(lease_id)
-            {
-                result.push(lease_id.clone());
+    let mut children_by_parent = BTreeMap::<LeaseId, Vec<LeaseId>>::new();
+    for (lease_id, entry) in &state.leases {
+        if let Some(parent) = &entry.certificate.parent_lease {
+            children_by_parent
+                .entry(parent.lease_id.clone())
+                .or_default()
+                .push(lease_id.clone());
+        }
+    }
+    for children in children_by_parent.values_mut() {
+        children.sort();
+    }
+
+    let mut result = Vec::new();
+    let mut pending = VecDeque::from([root.clone()]);
+    let mut seen = HashSet::from([root.clone()]);
+    while let Some(parent) = pending.pop_front() {
+        result.push(parent.clone());
+        if let Some(children) = children_by_parent.get(&parent) {
+            for child in children {
+                if seen.insert(child.clone()) {
+                    pending.push_back(child.clone());
+                }
             }
         }
-        index += 1;
     }
     Ok(result)
 }

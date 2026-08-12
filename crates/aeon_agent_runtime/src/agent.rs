@@ -9,6 +9,9 @@ use crate::ids::{
 };
 
 const MAX_DECLARATIVE_TEXT_BYTES: usize = 4096;
+pub const MAX_REQUESTED_TOOLS: usize = 64;
+pub const MAX_REQUESTED_CAPABILITIES: usize = 64;
+pub const MAX_AGENT_STEPS: u64 = 256;
 
 fn validate_declarative_text(kind: &'static str, value: &str) -> Result<()> {
     if value.trim().is_empty() || value.len() > MAX_DECLARATIVE_TEXT_BYTES {
@@ -61,8 +64,7 @@ declarative_text!(Objective, "objective");
 declarative_text!(Contract, "output contract");
 
 /// Untrusted, declarative request. Trusted bindings and lifecycle state live elsewhere.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentSpec {
     pub role: Role,
     pub objective: Objective,
@@ -72,6 +74,91 @@ pub struct AgentSpec {
     pub output_contract: Contract,
     pub resource_budget: ResourceRequest,
     pub semantic_requirements: SemanticRequirements,
+}
+
+impl AgentSpec {
+    pub fn validate(&self) -> Result<()> {
+        if self.requested_tools.len() > MAX_REQUESTED_TOOLS {
+            return Err(RuntimeError::new(
+                ErrorCode::InvalidInput,
+                format!("requested tools must not exceed {MAX_REQUESTED_TOOLS}"),
+            ));
+        }
+        for (index, tool_id) in self.requested_tools.iter().enumerate() {
+            if self.requested_tools[..index].contains(tool_id) {
+                return Err(RuntimeError::new(
+                    ErrorCode::DuplicateTool,
+                    format!("requested tool appears more than once: {tool_id}"),
+                ));
+            }
+        }
+        if self.requested_authority.capabilities.len() > MAX_REQUESTED_CAPABILITIES {
+            return Err(RuntimeError::new(
+                ErrorCode::InvalidInput,
+                format!("requested capabilities must not exceed {MAX_REQUESTED_CAPABILITIES}"),
+            ));
+        }
+        if self
+            .requested_authority
+            .capabilities
+            .iter()
+            .any(|capability| capability == &nexus::Capability::All)
+        {
+            return Err(RuntimeError::new(
+                ErrorCode::CapabilityAllForbidden,
+                "Capability::All is forbidden for synthesized agents",
+            ));
+        }
+        for (index, capability) in self.requested_authority.capabilities.iter().enumerate() {
+            if self.requested_authority.capabilities[..index].contains(capability) {
+                return Err(RuntimeError::new(
+                    ErrorCode::InvalidInput,
+                    "requested capabilities must not contain exact duplicates",
+                ));
+            }
+        }
+        if !(1..=MAX_AGENT_STEPS).contains(&self.resource_budget.max_steps) {
+            return Err(RuntimeError::new(
+                ErrorCode::BudgetExhausted,
+                format!("agent max steps must contain 1 to {MAX_AGENT_STEPS}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentSpecWire {
+    role: Role,
+    objective: Objective,
+    requested_model: ModelRef,
+    requested_tools: Vec<ToolId>,
+    requested_authority: AuthorityRequest,
+    output_contract: Contract,
+    resource_budget: ResourceRequest,
+    semantic_requirements: SemanticRequirements,
+}
+
+impl<'de> Deserialize<'de> for AgentSpec {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = AgentSpecWire::deserialize(deserializer)?;
+        let spec = Self {
+            role: wire.role,
+            objective: wire.objective,
+            requested_model: wire.requested_model,
+            requested_tools: wire.requested_tools,
+            requested_authority: wire.requested_authority,
+            output_contract: wire.output_contract,
+            resource_budget: wire.resource_budget,
+            semantic_requirements: wire.semantic_requirements,
+        };
+        spec.validate().map_err(serde::de::Error::custom)?;
+        Ok(spec)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,20 +205,32 @@ impl SemanticContext {
             retrieval_index_generation: &'a Option<Digest>,
         }
 
-        let mut bound_tool_digests = self.bound_tool_digests.clone();
+        let SemanticContext {
+            context_version: _,
+            model_manifest_digest,
+            resolved_system_instruction_digest,
+            tool_registry_root_digest,
+            bound_tool_digests,
+            protocol_schema_digest,
+            policy_epoch,
+            memory_generation,
+            retrieval_index_generation,
+        } = self;
+
+        let mut bound_tool_digests = bound_tool_digests.clone();
         bound_tool_digests.sort_unstable();
         bound_tool_digests.dedup();
         canonical_digest(
             "aeon-semantic-context-v1",
             &Identity {
-                model_manifest_digest: &self.model_manifest_digest,
-                resolved_system_instruction_digest: &self.resolved_system_instruction_digest,
-                tool_registry_root_digest: &self.tool_registry_root_digest,
+                model_manifest_digest,
+                resolved_system_instruction_digest,
+                tool_registry_root_digest,
                 bound_tool_digests,
-                protocol_schema_digest: &self.protocol_schema_digest,
-                policy_epoch: self.policy_epoch,
-                memory_generation: &self.memory_generation,
-                retrieval_index_generation: &self.retrieval_index_generation,
+                protocol_schema_digest,
+                policy_epoch: *policy_epoch,
+                memory_generation,
+                retrieval_index_generation,
             },
         )
     }
@@ -185,7 +284,6 @@ pub struct AgentRuntimeRecord {
     pub lifecycle: AgentLifecycle,
     pub current_step: u64,
     pub semantic_context: SemanticContext,
-    pub semantic_context_digest: Digest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
