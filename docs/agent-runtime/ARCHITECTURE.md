@@ -260,10 +260,13 @@ signature alone only proves what the runtime *claimed*; for genuine third-party
 verification the receipt must carry evidence the auditor can *recompute*. For the
 deterministic classes that means the receipt includes, or points to, the inputs
 that let an offline verifier re-derive the result: identity-field comparison for
-`MetadataOnly`; both manifest commitments for `MonotoneRegistryExtension`; the
-actual narrowing proof for `InstructionRefinement`; and the signed equivalence
-certification for `CertifiedModelEquivalence`. Without that, a receipt is evidence
-of a runtime assertion, not verification of compatibility.
+`MetadataOnly`; for `MonotoneRegistryExtension`, both manifest commitments plus
+canonical pre/post manifests or authenticated set-difference/inclusion proofs
+that establish additions-only and preserve existing bindings, together with a
+commitment and opening for the agent-visible interface proving that added tools
+were not visible; the actual narrowing proof for `InstructionRefinement`; and the
+signed equivalence certification for `CertifiedModelEquivalence`. Without that,
+a receipt is evidence of a runtime assertion, not verification of compatibility.
 
 **Boundaries.** `InstructionRefinement` requires proving a natural-language
 instruction is strictly narrowing — that is a research problem, and the honest
