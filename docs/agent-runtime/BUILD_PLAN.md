@@ -218,6 +218,12 @@ fail-closed failures after commit may still prevent Nexus entry; once Nexus
 execution begins, later revocation does not cancel that in-flight execution; and
 later calls are governed by the revocation.
 
+Task scheduling has its own atomic interrupt-check/admission linearization point.
+Interrupt-first rejects admission; admission-first permits only that
+already-linearized task, whose later authority consumption remains blocked by the
+committed stop; every later scheduling attempt rejects. Deterministic
+interrupt-versus-scheduling race tests must cover both orders.
+
 The stage must also define deterministic reader/writer admission. Once
 revoke/pause/emergency writer intent is pending, an unlimited stream of new
 execution commits cannot starve it. Under the documented concurrency limit,
@@ -276,6 +282,13 @@ canonical resource identity across heterogeneous tools.
 
 The informational half. Confidentiality × integrity labels on runtime objects;
 labels carried across handoffs; sinks check labels.
+
+Labels must also propagate through agent computation, not only direct object
+handoffs. R9 must select and specify an enforceable propagation mechanism, such
+as a floating subject label or dependency tainting, so each derived output or
+action joins the labels of the data that influenced it. Adversarial tests must
+read confidential data, derive a fresh outbound action, and prove that a lower-
+label sink rejects it unless an authorized declassification is consumed.
 
 **The novel part is declassification**, not the lattice: declassification
 consumes a budgeted authorization and emits a signed receipt naming labels
