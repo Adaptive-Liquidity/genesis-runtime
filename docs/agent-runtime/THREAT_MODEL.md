@@ -2,7 +2,7 @@
 
 ## Scope
 
-This threat model covers the standalone R0-R2 `genesis-runtime`: one mission, one scripted executing agent, in-memory delegated identity/lease chains, one successful fixture tool path, host-side gates, the pinned Nexus execution kernel, and in-memory evidence. It records later target threats so their absence is visible, but it does not claim controls that belong to R3-R18.
+This threat model covers the standalone R0–R2 `genesis-runtime`: one mission, one scripted executing agent, in-memory delegated identity/lease chains, one successful fixture tool path, host-side gates, the pinned Nexus execution kernel, and in-memory evidence. It records later target threats so their absence is visible, but it does not claim controls that belong to R3–R13.
 
 ## Assets
 
@@ -76,4 +76,4 @@ The authority-kernel tests cover delegation graphs, but the runtime still execut
 
 ## Required follow-on work
 
-R3 must add durable, crash-safe evidence before durability claims. R7-R9 must address action transactions, effects, IFC, and memory. R14 may add a scoped TLA+ model-check result, while implementation conformance remains separately tested. See [BUILD_PLAN.md](BUILD_PLAN.md).
+R3 must add crash-safe durable authority plus offline-verifiable action/execution evidence before durability or third-party-verification claims. R6 must add multi-agent scheduling, emergency control, and bounded writer admission; R8 must add resource-scoped coalition budgets; R9 must add IFC/MAC, AEON-IQ memory, and gated declassification; and R10 must add staged external effects, reconciliation, compensation, and the full transactional effect-certificate extension. R13 may add a scoped TLA+ model-check result, while implementation conformance and cryptographic correctness remain separately tested. See [BUILD_PLAN.md](BUILD_PLAN.md).

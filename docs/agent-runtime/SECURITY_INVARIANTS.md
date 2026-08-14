@@ -1,5 +1,7 @@
 # Security Invariants and Evidence
 
+<!-- markdownlint-disable MD013 -->
+
 ## Reading this document
 
 T1-T11 are architecture targets. The supplied v1.4 baseline explicitly labels only T1, T2, T3, T6, T7, T8, T9, and T11. It does not define the labels for T4, T5, or T10; this repository does not invent definitions for them.
@@ -42,6 +44,6 @@ The following rules are represented and exercised without assigning them an unde
 
 ## Evidence interpretation
 
-The evidence suite should be run with `cargo test --workspace --all-targets`. A passing run is necessary for an R0-R2 checkpoint but is not sufficient for a production or formal-verification claim.
+The evidence suite should be run with `cargo test --workspace --all-targets --locked`. A passing run is necessary for an R0-R2 checkpoint but is not sufficient for a production or formal-verification claim.
 
-No durability, crash-stability, tamper-evidence, exactly-once, distributed-revocation, coalition-safety, implementation-proof, or formal-verification claim is made. R14 is the roadmap stage for a scoped TLA+ model check; even that would not by itself prove Rust implementation conformance or cryptographic correctness.
+No durability, crash-stability, tamper-evidence, exactly-once, distributed-revocation, coalition-safety, implementation-proof, or formal-verification claim is made. R13 is the roadmap stage for a scoped TLA+ model check; even that would not by itself prove Rust implementation conformance or cryptographic correctness.
